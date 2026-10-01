@@ -358,8 +358,7 @@ impl Child {
     /// A host that bounds the worker process from outside the interpreter (the
     /// subprocess shell caps its own allocator) sizes that bound from this,
     /// after every request: the budget changes when a session is configured,
-    /// restored from a dump — which brings its own limits, not the
-    /// `Configure`'s — or ended by `Reset`.
+    /// restored from a dump with limits capped by `Configure`, or ended by `Reset`.
     #[must_use]
     pub fn session_budget(&self) -> SessionBudget {
         match &self.state {
@@ -935,9 +934,12 @@ impl Child {
     /// session), the repl exists and `Load` is rejected rather than silently
     /// discarding it.
     fn handle_load(&mut self, load: &pb::Load) -> pb::ChildEvent {
-        if !matches!(self.state, SessionState::Configured(_)) {
-            return protocol_violation("Load requires a session that has not started (a feed has already run)");
-        }
+        let limits = match &self.state {
+            SessionState::Configured(config) => {
+                ResourceLimits::from(config.as_ref().and_then(|config| config.limits).unwrap_or_default())
+            }
+            _ => return protocol_violation("Load requires a session that has not started (a feed has already run)"),
+        };
         let restored = match Dump::load(&load.state) {
             Ok(restored) => restored,
             Err(err) => return protocol_violation(&format!("failed to load session: {err}")),
@@ -946,8 +948,14 @@ impl Child {
             script_name,
             type_check,
             module_stubs,
-            state,
+            mut state,
         } = restored;
+        // Retain snapshot clocks and stricter limits across both idle and suspended restores.
+        match &mut state {
+            Session::Idle(repl) => repl.tracker_mut().tighten_limits(&limits),
+            Session::Suspended(progress) => progress.tracker_mut().tighten_limits(&limits),
+            Session::Running(_) => {}
+        }
         // In-process Rust producers can dump suspensions exceeding the wire size limit;
         // check transport compatibility even though snapshot integrity is the host's responsibility.
         let mut event = match state {
