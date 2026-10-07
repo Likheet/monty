@@ -824,6 +824,14 @@ fn os_call_span(os_call: &pb::OsCall, micros: u64, max_feed_duration: Option<u64
             args_cut |= cut;
             os_call!("import_stubs", args.modules = modules)
         }
+        // the pattern is recorded joined, as the user wrote it
+        Some(Call::Scan(s)) => os_call!(
+            "scan",
+            args.path = string_arg!(&s.path),
+            args.max_depth = s.max_depth,
+            args.follow_symlinks = s.follow_symlinks,
+            args.pattern = (!s.pattern.is_empty()).then(|| string_arg!(&s.pattern.join("/")))
+        ),
         None => os_call!(MISSING),
     });
     if args_cut {
