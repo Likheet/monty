@@ -504,11 +504,7 @@ fn descend_into_dirnames<'h>(
         .collect();
     let walk = walk_mut(this, vm);
     for name in names.iter().rev() {
-        let child = if name.starts_with('/') {
-            None
-        } else {
-            normalize_relative(&scan_join(&relative, name)).map(Cow::into_owned)
-        };
+        let child = normalized_child(&relative, name);
         let is_symlink = child
             .as_deref()
             .and_then(|child| walk.tree.get(child))
@@ -522,6 +518,20 @@ fn descend_into_dirnames<'h>(
         }
     }
     Ok(())
+}
+
+/// The tree path of a `dirnames` entry below `relative`, normalized as the
+/// tree is keyed; `None` when it leaves the tree. An already normal path is
+/// kept rather than copied again.
+fn normalized_child(relative: &str, name: &str) -> Option<String> {
+    if name.starts_with('/') {
+        return None;
+    }
+    let joined = scan_join(relative, name);
+    match normalize_relative(&joined)? {
+        Cow::Borrowed(_) => Some(joined),
+        Cow::Owned(normalized) => Some(normalized),
+    }
 }
 
 /// The walk inside a `DirScan` known to be one.

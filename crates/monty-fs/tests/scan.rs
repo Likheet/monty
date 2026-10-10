@@ -265,6 +265,24 @@ fn symlinks_are_described_and_followed_only_on_request() {
         let reply = scan(&mut table, glob("/mnt", &["*", "..", name])).unwrap();
         assert!(!reply.iter().any(|(path, _)| path == name), "{name} leaked: {reply:?}");
     }
+
+    // `OverlayMemory` refuses links: a listing shows an in-mount one as a link
+    // and nothing more, and a literal lookup finds nothing, as `exists()` would
+    let mut overlay = mount(&dir, MountMode::OverlayMemory(OverlayState::new()));
+    let top = scan(&mut overlay, ScanArgs::listing("/mnt".into(), Some(1), false)).unwrap();
+    assert_eq!(
+        top,
+        entries(&[
+            ("", 'd'),
+            ("a.txt", 'f'),
+            ("b.py", 'f'),
+            ("linkdir", 'l'),
+            ("linkfile", 'l'),
+            ("sub", 'd'),
+        ])
+    );
+    let err = scan(&mut overlay, ScanArgs::listing("/mnt/linkfile".into(), Some(0), false)).unwrap_err();
+    assert_eq!(err.into_exception().exc_type(), ExcType::FileNotFoundError);
 }
 
 /// A root the mount cannot list fails the scan, as CPython's `scandir` would;
