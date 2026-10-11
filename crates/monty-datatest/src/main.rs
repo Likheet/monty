@@ -649,6 +649,40 @@ impl FixtureRegistry {
         value
     }
 
+    /// The host module `import tools` binds: its attrs are the fixture
+    /// functions, so `tools.add_ints(1, 2)` dispatches like a bare `add_ints(1, 2)`.
+    fn make_tools_module() -> MontyObject {
+        // `tools.nested`: a submodule, reached as an attribute of its parent
+        let nested = MontyObject::module(
+            "tools.nested",
+            MontyUuid::from_u128(6),
+            [
+                (
+                    MontyObject::string("return_value"),
+                    MontyObject::function("return_value", None),
+                ),
+                (MontyObject::string("VERSION"), MontyObject::int(7)),
+            ],
+        );
+        let functions = [
+            "add_ints",
+            "concat_strings",
+            "return_value",
+            "get_list",
+            "raise_error",
+            "async_call",
+            "async_fail",
+        ];
+        MontyObject::module(
+            "tools",
+            MontyUuid::from_u128(5),
+            functions
+                .iter()
+                .map(|name| (MontyObject::string(*name), MontyObject::function(*name, None)))
+                .chain([(MontyObject::string("nested"), nested)]),
+        )
+    }
+
     /// Registers and returns a `Point(x, y)` (type_id 1).
     fn make_point(&mut self, x: i64, y: i64) -> MontyObject {
         self.register(Fixture {
@@ -697,6 +731,11 @@ fn dispatch_method_call(
     let class_name = fixture.class_name;
 
     match (class_name, method_name) {
+        // The host decides callability; none of these fixtures is callable.
+        (_, "__call__") => {
+            let message = format!("'{class_name}' object is not callable");
+            MontyException::new(ExcType::TypeError, Some(message)).into()
+        }
         // Point.sum(self) -> int
         ("Point" | "MutablePoint", "sum") => MontyObject::int(fixture.int_attr("x") + fixture.int_attr("y")).into(),
         // Point.add(self, dx, dy) -> Point
@@ -984,6 +1023,10 @@ fn get_virtual_dir_entries(path: &str) -> Option<Vec<String>> {
 #[expect(clippy::cast_possible_wrap)] // Virtual file sizes are tiny, no wrap possible
 fn dispatch_os_call(call: &OsFunctionCall) -> ExtFunctionResult {
     match call {
+        // Only the tools fixture is available as a host module.
+        OsFunctionCall::Import(module) if module == "tools" => FixtureRegistry::make_tools_module().into(),
+        OsFunctionCall::Import(_) => ExtFunctionResult::NotFound(call.name().to_owned()),
+        OsFunctionCall::ImportStubs(_) => unreachable!("{} is asked only by a type-checking worker", call.name()),
         // Fixed bytes for `os.urandom()`; fixtures assert invariants because CPython reads real entropy.
         OsFunctionCall::Urandom(args) => MontyObject::bytes(fixture_entropy(args.size)).into(),
         // `OsPolicy::default()` answers the clock and initial random seed in the sandbox.
@@ -1938,7 +1981,7 @@ fn run_iter_loop(exec: MontyRun, limits: ResourceLimits) -> Result<MontyObject, 
 /// the real dump format rather than only the underlying serde impls.
 #[cfg(not(feature = "memory-model-checks"))]
 fn dump_load_round_trip(progress: &RunProgress) -> RunProgress {
-    let bytes = dump("test.py", None, SessionRef::Running(progress)).expect("failed to dump RunProgress");
+    let bytes = dump("test.py", None, &[], SessionRef::Running(progress)).expect("failed to dump RunProgress");
     match Dump::load(&bytes).expect("failed to load RunProgress").state {
         Session::Running(progress) => *progress,
         _ => panic!("dumped a running session, loaded something else"),
@@ -1972,12 +2015,13 @@ fn idle_dump_round_trip(path: &Path, code: &str, config: &TestConfig) -> Result<
     // the case's own outcome was checked by the main run; a raising case still leaves its globals
     let _ = repl.feed_run(code, vec![], PrintWriter::Disabled);
 
-    let first = dump(&test_name, None, SessionRef::Idle(&repl)).map_err(|err| failure(format!("dump: {err}")))?;
+    let first = dump(&test_name, None, &[], SessionRef::Idle(&repl)).map_err(|err| failure(format!("dump: {err}")))?;
     let loaded = Dump::load(&first).map_err(|err| failure(format!("load: {err}")))?;
     let Session::Idle(loaded) = loaded.state else {
         return Err(failure("dumped an idle session, loaded something else".to_string()));
     };
-    let second = dump(&test_name, None, SessionRef::Idle(&loaded)).map_err(|err| failure(format!("re-dump: {err}")))?;
+    let second =
+        dump(&test_name, None, &[], SessionRef::Idle(&loaded)).map_err(|err| failure(format!("re-dump: {err}")))?;
     if first == second {
         Ok(())
     } else {
