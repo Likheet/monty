@@ -266,6 +266,7 @@ ExcType = Literal[
     'UnicodeDecodeError',
     'UnicodeEncodeError',
     'json.JSONDecodeError',
+    'tomllib.TOMLDecodeError',
     'ImportError',
     'ModuleNotFoundError',
     'OSError',
@@ -289,9 +290,9 @@ ExcType = Literal[
 
 Used by `ExternalExceptionData` to identify an exception by name rather than
 passing a concrete Python exception instance. Names match Python's built-in
-exception classes, except for `json.JSONDecodeError`, `re.PatternError`,
-`binascii.Error` and `binascii.Incomplete`, which are dotted to disambiguate
-from their `ValueError` / `Exception` parents.
+exception classes, except for `json.JSONDecodeError`, `tomllib.TOMLDecodeError`,
+`re.PatternError`, `binascii.Error` and `binascii.Incomplete`, which are dotted to
+disambiguate from their `ValueError` / `Exception` parents.
 """
 
 
