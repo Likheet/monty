@@ -1224,6 +1224,14 @@ fn large_allocations_are_rejected_before_the_hard_limit() {
         // would fit is still refused.
         ("import hashlib\nhashlib.shake_128().digest(2_000_000)", 2_045_903),
         ("import hashlib\nhashlib.shake_128().hexdigest(400_000)", 1_245_904),
+        // `tomllib` builds a tree whose elements cost far more than the source
+        // bytes each takes (`[[a]]` is a whole table), so the parser polls per
+        // array element and per statement.
+        (
+            "import tomllib\ntomllib.loads('x = [' + '1,' * 200_000 + ']')",
+            1_622_962,
+        ),
+        ("import tomllib\ntomllib.loads('[[a]]\\n' * 100_000)", 1_233_513),
     ];
 
     for (code, expected) in cases {
