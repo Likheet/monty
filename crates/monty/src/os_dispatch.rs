@@ -317,6 +317,9 @@ pub(crate) enum PostConversionEffect {
         /// lengthened the payload: CPython reports that, not what reached the file.
         #[serde(default)]
         text_length: Option<u64>,
+        /// Answer `None` instead of the count: the write came from `json.dump`.
+        #[serde(default)]
+        discard_count: bool,
     },
     /// Preserve `open()`'s filename while the returned handle supplies the I/O target,
     /// and apply the `newline` argument, whose value CPython validates after the open.

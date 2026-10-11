@@ -2179,8 +2179,11 @@ impl<'h> VM<'h> {
                 apply_file_next(file_id, default, value, self).map(Some)
             }
             Some(PendingEffect::Post(PostConversionEffect::WritePosition {
-                file_id, text_length, ..
-            })) => apply_write_position(file_id, text_length, value, self).map(Some),
+                file_id,
+                text_length,
+                discard_count,
+                ..
+            })) => apply_write_position(file_id, text_length, discard_count, value, self).map(Some),
             Some(PendingEffect::Post(PostConversionEffect::OpenName { name, newline })) => {
                 apply_open_name(name, newline, value, self).map(Some)
             }
