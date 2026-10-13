@@ -16,8 +16,8 @@ use monty_proto::{
     WireFunctionCall, exceeds_max_frame_len, ext_result_to_proto, named_values_to_proto, pb, write_frame,
 };
 use monty_types::{
-    CallArgs, DateTimeSource, ExtFunctionResult, MontyDate, MontyDateTime, MontyObject, NameLookupResult, NamedValues,
-    OsPolicy, RandomSeed, RandomStart, SandboxTimeZone, SleepMode, SourceRange,
+    CallArgs, DateTimeSource, ExtFunctionResult, IMPORT_STUBS_CALL_ID, MontyDate, MontyDateTime, MontyObject,
+    NameLookupResult, NamedValues, OsPolicy, RandomSeed, RandomStart, SandboxTimeZone, SleepMode, SourceRange,
     unstable::{self, MontyNode},
 };
 
@@ -1219,6 +1219,11 @@ fn large_allocations_are_rejected_before_the_hard_limit() {
             "import itertools\nnext(itertools.product('ab', repeat=1_000_000))",
             24_044_628,
         ),
+        // A SHAKE digest preflights its output; `hexdigest` also counts the raw
+        // digest it keeps live while encoding, so a length whose hex alone
+        // would fit is still refused.
+        ("import hashlib\nhashlib.shake_128().digest(2_000_000)", 2_045_903),
+        ("import hashlib\nhashlib.shake_128().hexdigest(400_000)", 1_245_904),
     ];
 
     for (code, expected) in cases {
@@ -1232,6 +1237,28 @@ fn large_allocations_are_rejected_before_the_hard_limit() {
         assert_eq!(child.feed_complete("1 + 1"), MontyObject::int(2), "{code}");
         child.shutdown();
     }
+}
+
+/// `os.path.expandvars` amplifies its input by the length of the values it
+/// substitutes, so the result's growth is charged like a `StringBuilder`'s:
+/// refused at a capacity doubling, before the worker reaches its hard ceiling.
+#[test]
+fn expandvars_growth_is_rejected_before_the_hard_limit() {
+    let code = "import os\nos.path.expandvars('$V' * 20_000)";
+    let mut child = ChildProc::spawn();
+    child.create_repl_with(configure_with_max_memory(1024 * 1024));
+    let (_, event) = child.feed(code);
+    let pb::child_event::Kind::OsCall(call) = event else {
+        panic!("expected OsCall, got {event:?}");
+    };
+    let environ = MontyObject::dict([(MontyObject::string("V"), MontyObject::string("x".repeat(1000)))]);
+    let (_, event) = child.resume_return(call.call_id, environ);
+    let error = expect_error(event);
+    assert_eq!(error.exc_type, "MemoryError", "{code}");
+    let message = error.message.expect("MemoryError should have a message");
+    assert_reported_usage(&message, 1_370_472, code);
+    assert_eq!(child.feed_complete("1 + 1"), MontyObject::int(2), "{code}");
+    child.shutdown();
 }
 
 /// A merge charges the pairs it copies out, but not room for every one of them
@@ -2038,6 +2065,115 @@ fn loading_a_dump_applies_its_own_memory_limit() {
     );
 }
 
+/// Every `binascii`/`base64` conversion whose output is larger than its input
+/// can be handed a buffer that fits under the soft limit and encodes to one
+/// that clears the allocator's hard ceiling, which kills the worker rather
+/// than raising. Each preflights its output, so the session survives.
+///
+/// The sizes matter: the input must fit under the soft limit while the
+/// expansion clears soft + `BASE_HEADROOM`, which needs a limit above 2 MiB.
+/// `a85decode` is here rather than among the decoders because Ascii85's `z`
+/// stands for a whole zero word, so a buffer of them quadruples.
+#[test]
+fn expanding_codecs_fail_softly() {
+    const LIMIT: u64 = 8 * 1024 * 1024;
+    // smallest expansion here is base64's 4/3, so 5 MB covers every case
+    const SETUP: &str = "import binascii, base64\nsrc = {FILL} * 5_000_000\n";
+    let cases = [
+        ("b'\\xff'", "binascii.hexlify(src)"),
+        ("b'\\xff'", "binascii.b2a_base64(src)"),
+        ("b'\\xff'", "binascii.b2a_qp(src)"),
+        ("b'\\xff'", "base64.b64encode(src)"),
+        ("b'\\xff'", "base64.b32encode(src)"),
+        ("b'\\xff'", "base64.b16encode(src)"),
+        ("b'\\xff'", "base64.b85encode(src)"),
+        ("b'\\xff'", "base64.a85encode(src)"),
+        ("b'\\xff'", "base64.encodebytes(src)"),
+        ("b'z'", "base64.a85decode(src)"),
+    ];
+
+    for (fill, call) in cases {
+        let mut child = ChildProc::spawn();
+        child.create_repl_with(configure_with_max_memory(LIMIT));
+        let (_, event) = child.feed(&format!("{}{call}", SETUP.replace("{FILL}", fill)));
+        assert_eq!(expect_error(event).exc_type, "MemoryError", "{call}");
+        // the worker raised rather than exiting, so it is still serving
+        assert_eq!(child.feed_complete("1 + 1"), MontyObject::int(2), "{call}");
+        child.shutdown();
+    }
+}
+
+/// A conversion that appends to, or frames, a buffer it filled exactly must
+/// reserve that room before filling it. `Vec` doubles when it grows, so one
+/// appended byte charges the session a second copy of the encoded output —
+/// a burst the preflight never accounted for, and past the allocator's hard
+/// ceiling with it.
+///
+/// Each size sits in the window where the preflight passes but the doubling
+/// would not, so before the reservations every case exited the worker and the
+/// parent saw EOF instead of a turn-ending event.
+#[test]
+fn expanding_codecs_reserve_what_they_preflight() {
+    // (max_memory, code, the length CPython gives for the same call)
+    let cases = [
+        // the Ascii85 `z` word, which is sized from the input's content
+        (
+            30 * 1024 * 1024,
+            "import base64\nsrc = b'z' * 5_000_000\nlen(base64.a85decode(src))",
+            20_000_000,
+        ),
+        // the trailing newline appended to an exactly filled base64 buffer
+        (
+            32 * 1024 * 1024,
+            "import binascii\nsrc = b'\\xff' * 12_000_000\nlen(binascii.b2a_base64(src))",
+            16_000_001,
+        ),
+        // quoted-printable, whose bound is not a fixed ratio of its input
+        (
+            48 * 1024 * 1024,
+            "import binascii\nsrc = b'\\xff' * 11_000_000\nlen(binascii.b2a_qp(src))",
+            33_879_998,
+        ),
+        // the `<~` / `~>` framing spliced onto both ends of the encoded output
+        (
+            32 * 1024 * 1024,
+            "import base64\nsrc = b'\\xff' * 9_000_000\nlen(base64.a85encode(src, adobe=True))",
+            11_250_004,
+        ),
+    ];
+
+    for (limit, code, encoded_len) in cases {
+        let mut child = ChildProc::spawn();
+        child.create_repl_with(configure_with_max_memory(limit));
+        assert_eq!(child.feed_complete(code), MontyObject::int(encoded_len), "{code}");
+        child.shutdown();
+    }
+}
+
+/// `b2a_qp`'s buffer is sized from what the input actually quotes, not from
+/// the worst case every byte escaping.
+///
+/// Plain text encodes to a little over its own length, so bounding it at the
+/// 3.125 bytes per byte that `b'\xff'` reaches would reject, at a third of the
+/// budget it needs, an input the session has ample room for. Dots and newlines
+/// expand only in position, so text full of them must not be charged as if
+/// every one did.
+#[test]
+fn quoted_printable_is_sized_from_what_it_quotes() {
+    let cases = [
+        ("b'a' * 10_000_000", 10_266_666),
+        // every dot starts a line and escapes; no newline expands
+        ("b'.\\n' * 4_000_000", 16_000_000),
+    ];
+    for (src, encoded_len) in cases {
+        let mut child = ChildProc::spawn();
+        child.create_repl_with(configure_with_max_memory(32 * 1024 * 1024));
+        let code = format!("import binascii\nsrc = {src}\nlen(binascii.b2a_qp(src))");
+        assert_eq!(child.feed_complete(&code), MontyObject::int(encoded_len), "{src}");
+        child.shutdown();
+    }
+}
+
 /// A `Configure` carrying `max_memory`, which is what limits the worker.
 fn configure_with_max_memory(bytes: u64) -> pb::Configure {
     pb::Configure {
@@ -2255,7 +2391,12 @@ fn reset_scrubs_type_check_state_from_the_next_session() {
             ..Default::default()
         });
         let mut probe = |code: String| {
-            let (_, event) = child.feed(&code);
+            let (_, mut event) = child.feed(&code);
+            // a host module name is asked about once; the stubs are declined here
+            if matches!(&event, pb::child_event::Kind::OsCall(call) if call.call_id == IMPORT_STUBS_CALL_ID) {
+                let reply = pb::ext_function_result::Kind::NotHandled(pb::Unit {});
+                event = child.resume_call(IMPORT_STUBS_CALL_ID, reply).1;
+            }
             let pb::child_event::Kind::TypingError(typing) = event else {
                 panic!("expected TypingError for {code:?} after {script_name:?}, got {event:?}");
             };

@@ -792,6 +792,24 @@ pub(crate) trait ExcTypeExt: Sized {
         .into()
     }
 
+    /// Creates `genericpath._check_arg_types`'s TypeError for an `os.path`
+    /// argument that is neither `str` nor `bytes`:
+    /// `{func}() argument must be str, bytes, or os.PathLike object, not '{type}'`
+    #[must_use]
+    fn type_error_path_argument(func: &str, type_name: &str) -> RunError {
+        Self::type_error(format!(
+            "{func}() argument must be str, bytes, or os.PathLike object, not '{type_name}'"
+        ))
+    }
+
+    /// Creates `genericpath._check_arg_types`'s TypeError for `os.path`
+    /// arguments mixing `str` and `bytes`:
+    /// `Can't mix strings and bytes in path components`
+    #[must_use]
+    fn type_error_mixed_path_components() -> RunError {
+        Self::type_error("Can't mix strings and bytes in path components")
+    }
+
     /// Creates the `os.fspath` TypeError, also raised by pure-Python `os`
     /// functions that call `fspath` internally (e.g. `os.makedirs`):
     /// `expected str, bytes or os.PathLike object, not {type}`
@@ -827,6 +845,18 @@ pub(crate) trait ExcTypeExt: Sized {
     #[must_use]
     fn overflow_fd_minimum() -> RunError {
         SimpleException::new_msg(ExcType::OverflowError, "fd is less than minimum").into()
+    }
+
+    /// Creates `OSError: [Errno 9] Bad file descriptor`, naming the fd when
+    /// the call does (`os.stat(fd)` does, `os.listdir(fd)` does not). Every
+    /// fd is closed in the sandbox, so this is what an int path fails with.
+    #[must_use]
+    fn bad_file_descriptor(fd: Option<&str>) -> RunError {
+        let msg = match fd {
+            Some(fd) => format!("[Errno 9] Bad file descriptor: {fd}"),
+            None => "[Errno 9] Bad file descriptor".to_owned(),
+        };
+        SimpleException::new_msg(ExcType::OSError, msg).into()
     }
 
     /// Creates the NotImplementedError CPython raises when an `os` argument is
@@ -1278,6 +1308,15 @@ pub(crate) trait ExcTypeExt: Sized {
         SimpleException::new_msg(ExcType::ValueError, "negative count").into()
     }
 
+    /// Creates the `ValueError` CPython's float-to-string conversion raises for a
+    /// precision above `MAX_FLOAT_PRECISION` (`INT_MAX - 1024`).
+    ///
+    /// Matches CPython's format: `ValueError: precision too big`
+    #[must_use]
+    fn value_error_precision_too_big() -> RunError {
+        SimpleException::new_msg(ExcType::ValueError, "precision too big").into()
+    }
+
     /// Creates a TypeError for isinstance() arg 2.
     ///
     /// Matches CPython's format: `TypeError: isinstance() arg 2 must be a type, a tuple of types, or a union`
@@ -1336,6 +1375,17 @@ pub(crate) trait ExcTypeExt: Sized {
     #[must_use]
     fn runtime_error_dict_changed_size() -> RunError {
         SimpleException::new_msg(ExcType::RuntimeError, "dictionary changed size during iteration").into()
+    }
+
+    /// Creates a RuntimeError for a dict whose keys were replaced mid-iteration.
+    ///
+    /// CPython's second iteration guard: the size never changed, but a delete
+    /// plus an insert renumbered the table under the cursor.
+    ///
+    /// Matches CPython's format: `RuntimeError: dictionary keys changed during iteration`
+    #[must_use]
+    fn runtime_error_dict_changed_keys() -> RunError {
+        SimpleException::new_msg(ExcType::RuntimeError, "dictionary keys changed during iteration").into()
     }
 
     /// Creates a TypeError for `reversed()` on a non-reversible object.
@@ -1482,13 +1532,17 @@ pub(crate) trait ExcTypeExt: Sized {
         )
     }
 
-    /// Creates a ModuleNotFoundError for when a module cannot be found.
-    ///
-    /// Matches CPython's format: `ModuleNotFoundError: No module named 'name'`
+    /// Creates `ModuleNotFoundError: No module named 'name'`, with
+    /// `; 'parent' is not a package` when a dotted import failed below a
+    /// module (see `StandardLib::missing_module`).
     /// Sets `hide_caret: true` because CPython doesn't show carets for module not found errors.
     #[must_use]
-    fn module_not_found_error(module_name: &str) -> RunError {
-        let exc = SimpleException::new_msg(ExcType::ModuleNotFoundError, format!("No module named '{module_name}'"));
+    fn module_not_found_error(module_name: &str, parent: Option<&str>) -> RunError {
+        let msg = match parent {
+            Some(parent) => format!("{}; '{parent}' is not a package", no_module_named(module_name)),
+            None => no_module_named(module_name),
+        };
+        let exc = SimpleException::new_msg(ExcType::ModuleNotFoundError, msg);
         RunError::Exc(ExceptionRaise {
             exc,
             frame: None,
@@ -1676,6 +1730,20 @@ pub(crate) trait ExcTypeExt: Sized {
     #[must_use]
     fn overflow_c_long() -> RunError {
         SimpleException::new_msg(ExcType::OverflowError, "Python int too large to convert to C long").into()
+    }
+
+    /// `OverflowError: Python int too large for C unsigned long`, from Argument
+    /// Clinic's `unsigned_long` converter on an int beyond `u64`.
+    #[must_use]
+    fn overflow_c_unsigned_long() -> RunError {
+        SimpleException::new_msg(ExcType::OverflowError, "Python int too large for C unsigned long").into()
+    }
+
+    /// `ValueError: Cannot convert negative int`, which the unsigned Argument
+    /// Clinic converters raise before checking an int's width.
+    #[must_use]
+    fn value_error_negative_int() -> RunError {
+        SimpleException::new_msg(ExcType::ValueError, "Cannot convert negative int").into()
     }
 
     /// Creates the TypeError for three-argument `pow()` with a non-integer operand and no
@@ -2814,6 +2882,11 @@ impl RunError {
     pub fn internal(msg: impl Into<Cow<'static, str>>) -> Self {
         Self::Internal(msg.into())
     }
+}
+
+/// CPython's `ModuleNotFoundError` message for `module_name`.
+fn no_module_named(module_name: &str) -> String {
+    format!("No module named '{module_name}'")
 }
 
 /// Formats a list of parameter names for error messages, matching CPython's

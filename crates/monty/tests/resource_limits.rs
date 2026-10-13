@@ -2,6 +2,7 @@
 ///
 /// Allocator-backed memory limits are exercised through worker subprocesses.
 use std::{
+    fmt::Write,
     thread,
     time::{Duration, Instant},
 };
@@ -500,6 +501,26 @@ fn assert_timeout_in_builtin(code: &str, label: &str) {
 /// Test that `sum(range(huge))` respects the time limit.
 ///
 /// `sum()` iterates via `for_next()`, which polls the time limit every 64th step.
+/// A dict walk polls the clock by entries yielded, not by slot. With every
+/// even slot tombstoned the slot only takes even values, so a poll keyed on it
+/// never fired and nested comparisons ran unbounded past the time limit.
+#[test]
+fn timeout_in_dict_comparison_over_tombstones() {
+    let code = "
+def build(depth):
+    child = 0
+    for _ in range(depth):
+        d = {i: child for i in range(128)}
+        for i in range(0, 128, 2):
+            d.pop(i)
+        child = d
+    return child
+
+build(5) == build(5)
+";
+    assert_timeout_in_builtin(code, "dict comparison over tombstones");
+}
+
 #[test]
 fn timeout_in_sum_builtin() {
     assert_timeout_in_builtin("sum(range(10**18))", "sum(range(10**18))");
@@ -662,6 +683,55 @@ fn bytes_search_is_not_quadratic() {
             outcome.elapsed
         );
     }
+}
+
+/// Runs `code` over one `data` argument of `size` bytes under `limits`.
+fn run_over_bytes(code: &str, size: usize, limits: ResourceLimits) -> (Duration, Result<MontyObject, MontyException>) {
+    let mut run = MontyRun::new(
+        code.to_owned(),
+        "test.py",
+        vec!["data".to_owned()],
+        CompileOptions::default(),
+    )
+    .unwrap();
+    let start = Instant::now();
+    let result = run.run(
+        vec![MontyObject::bytes(vec![b'a'; size])],
+        ResourceTracker::new(limits),
+        PrintWriter::Stdout,
+    );
+    (start.elapsed(), result)
+}
+
+/// Hashing polls the deadline once per input chunk, so a large `update()` is
+/// interrupted instead of running to completion.
+#[test]
+fn timeout_in_hashing() {
+    let limits = ResourceLimits::default().max_feed_duration(Duration::from_millis(20));
+    let (elapsed, result) = run_over_bytes(
+        "import hashlib\nhashlib.sha3_512(data).hexdigest()",
+        128 * 1024 * 1024,
+        limits,
+    );
+    let exc = result.expect_err("expected the time limit to fire");
+    assert_eq!(exc.exc_type(), ExcType::TimeoutError);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "should terminate promptly, took {elapsed:?}"
+    );
+}
+
+/// PBKDF2 absorbs the salt once, so a large salt costs one pass however many
+/// output blocks are derived.
+#[test]
+fn pbkdf2_hashes_the_salt_once() {
+    let limits = ResourceLimits::default().max_feed_duration(Duration::from_secs(5));
+    let (_, result) = run_over_bytes(
+        "import hashlib\nlen(hashlib.pbkdf2_hmac('sha256', b'p', data, 1, dklen=4096))",
+        8 * 1024 * 1024,
+        limits,
+    );
+    assert_eq!(result.unwrap(), MontyObject::int(4096));
 }
 
 /// Bytes searches must remain interruptible by the time limit.
@@ -940,6 +1010,40 @@ s = 'a\n' * 5_000_000
 s.splitlines()
 ";
     assert_timeout_in_builtin(code, "str.splitlines()");
+}
+
+/// A `default_factory` re-enters `run()` with a fresh dispatch countdown, so a
+/// construction whose factories are each shorter than the interval reaches no
+/// checkpoint of its own. The binder therefore polls the clock itself, like
+/// every other native loop that calls back into Python.
+#[test]
+fn timeout_in_dataclass_default_factories() {
+    const FIELDS: usize = 200;
+
+    let mut repl = MontyRepl::new("test.py", ResourceTracker::default(), CompileOptions::default());
+    let body = (0..FIELDS).fold(String::new(), |mut body, i| {
+        let _ = writeln!(body, "    f{i}: int = field(default_factory=tick)");
+        body
+    });
+    repl.feed_run(
+        &format!(
+            "from dataclasses import dataclass, field\ndef tick():\n    print('.', end='')\n    return 1\n@dataclass\nclass Many:\n{body}"
+        ),
+        vec![],
+        PrintWriter::Stdout,
+    )
+    .expect("the class should build without a limit");
+
+    // Also resets the execution clock, so the budget is spent a few factories in.
+    repl.tracker_mut().set_max_feed_duration(Duration::from_nanos(1));
+    let mut printed = String::new();
+    let exc = repl
+        .feed_run("Many()", vec![], PrintWriter::collect_string(&mut printed))
+        .expect_err("the factory loop must hit the time limit");
+    assert_eq!(exc.exc_type(), ExcType::TimeoutError);
+    // The poll fires on the interval's last index, before the factory it guards,
+    // so anything near `FIELDS` means the loop never checked at all.
+    assert_eq!(printed.len(), ResourceTracker::LOOP_CHECK_INTERVAL - 1);
 }
 
 #[test]

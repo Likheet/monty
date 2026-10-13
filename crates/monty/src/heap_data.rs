@@ -94,7 +94,9 @@ macro_rules! heap_payloads {
             #[serde(rename = "M")]
             BoundMethod(inline $crate::types::BoundMethod),
             /// One `dataclasses.Field` held by a class's `__dataclass_fields__` dictionary.
-            DataclassField(inline $crate::modules::dataclasses::DataclassField),
+            /// Boxed: a name, an annotation and a default or factory are already
+            /// wider than the 32-bit ceiling, and `Field` has attributes left to gain.
+            DataclassField(boxed $crate::modules::dataclasses::DataclassField),
             /// A `list_iterator` object.
             ListIterator(inline $crate::types::list::ListIterator),
             /// A `_collections._deque_iterator` object.
@@ -164,6 +166,8 @@ macro_rules! heap_payloads {
             Union(inline $crate::types::Union),
             /// A `random.Random` generator instance.
             Random(boxed $crate::types::Random),
+            /// A `hashlib` hash object mid-stream.
+            HashObject(boxed $crate::types::HashObject),
         }
     };
 }
@@ -188,9 +192,17 @@ macro_rules! define_heap_data {
 
 heap_payloads!(define_heap_data);
 
-// `HeapData` is copied on every allocate and free. `Dict`, the largest hot
-// variant, sets the payload ceiling; larger variants should remain boxed.
-const _: () = assert!(mem::size_of::<HeapData>() <= 80);
+/// The widest `HeapData` may be, per target.
+///
+/// `Dict` sets it on 64-bit hosts. On 32-bit (the wasm worker) `Dict` halves
+/// while `Value`-built payloads do not, so the itertools family sets it instead
+/// — see the budget those adaptors are held to in `types::itertools`.
+const MAX_HEAP_DATA_SIZE: usize = if cfg!(target_pointer_width = "64") { 80 } else { 56 };
+
+// `HeapData` is copied on every allocate and free, and every byte past the
+// ceiling widens every slot of every heap page. Box the variant that trips
+// this, not the enum: growing the budget here charges the hot variants too.
+const _: () = assert!(mem::size_of::<HeapData>() <= MAX_HEAP_DATA_SIZE);
 
 impl HeapData {
     /// Returns whether this heap data type can participate in reference cycles.
@@ -265,7 +277,8 @@ impl HeapData {
             | Self::Time(_)
             | Self::TimeDelta(_)
             | Self::TimeZone(_)
-            | Self::Random(_) => false,
+            | Self::Random(_)
+            | Self::HashObject(_) => false,
         }
     }
 
@@ -307,6 +320,7 @@ impl HeapData {
             Self::Dict(_) => Type::Dict,
             Self::Partial(_) => Type::Partial,
             Self::Random(_) => Type::Random,
+            Self::HashObject(hash) => hash.algorithm().py_type(),
             Self::GenericAlias(_) => Type::GenericAlias,
             Self::Union(_) => Type::Union,
             Self::DictKeysView(_) => Type::DictKeys,
@@ -645,6 +659,7 @@ macro_rules! heap_read_output_py_trait_forward {
             Self::Itertools($value) => $body,
             Self::Partial($value) => $body,
             Self::Random($value) => $body,
+            Self::HashObject($value) => $body,
             Self::GenericAlias($value) => $body,
             Self::Union($value) => $body,
             Self::Tuple($value) => $body,
@@ -954,8 +969,9 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
             else {
                 match self {
                     Self::Cell(value) => Ok(Some(identity_hash(value.id()))),
+                    // modules hash by identity, as CPython's do
+                    Self::Module(value) => Ok(Some(identity_hash(value.id()))),
                     Self::Exception(_)
-                    | Self::Module(_)
                     | Self::Coroutine(_)
                     | Self::GatherFuture(_)
                     | Self::ExternalFuture(_) => Ok(None),
@@ -973,7 +989,7 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
                 match self {
                     Self::Cell(cell) => Ok(write!(f, "<cell: {} object>", cell.get(vm.heap).0.py_type_name(vm))?),
                     Self::Exception(e) => Ok(e.get(vm.heap).py_repr_fmt(f)?),
-                    Self::Module(m) => Ok(write!(f, "<module '{}'>", vm.interns.get_str(m.get(vm.heap).name()))?),
+                    Self::Module(m) => Ok(write!(f, "<module '{}'>", m.get(vm.heap).name_str(vm.interns))?),
                     Self::Coroutine(coro) => {
                         let func = vm.interns.get_function(coro.get(vm.heap).func_id);
                         let name = vm.interns.get_str(func.name.name_id);
@@ -1149,6 +1165,7 @@ impl<'h> PyTrait<'h> for HeapReadOutput<'h> {
             | Self::ExtFunction(_)
             | Self::Partial(_)
             | Self::Random(_)
+            | Self::HashObject(_)
             | Self::GenericAlias(_)
             | Self::Union(_)
             | Self::Cell(_)
