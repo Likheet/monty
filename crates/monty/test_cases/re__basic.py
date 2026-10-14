@@ -153,7 +153,7 @@ pattern = re.compile(r'^\w+', re.MULTILINE)
 result = pattern.findall('line1\nline2\nline3')
 assert result == ['line1', 'line2', 'line3']
 
-# Without MULTILINE, $ matches only end of string
+# Without MULTILINE, $ matches only at the end of the string, or before a newline that ends it
 pattern = re.compile(r'\w+$')
 result = pattern.findall('line1\nline2\nline3')
 assert result == ['line3']
@@ -162,6 +162,38 @@ assert result == ['line3']
 pattern = re.compile(r'\w+$', re.MULTILINE)
 result = pattern.findall('line1\nline2\nline3')
 assert result == ['line1', 'line2', 'line3']
+
+# === $ and \Z at a trailing newline ===
+# $ also matches before a newline that ends the string; \Z only at the very end
+m = re.match(r'^\d+$', '123\n')
+assert m is not None
+assert m.group() == '123'
+assert re.search(r'ab$', 'ab\n\n') is None
+assert re.findall(r'\w+$', 'line1\nline2\n') == ['line2']
+assert re.findall(r'$', 'a\n') == ['', '']
+assert re.sub(r'$', '!', 'a\n') == 'a!\n!'
+assert re.split(r'$', 'a\nb\n') == ['a\nb', '\n', '']
+m = re.search(r'a$\n', 'a\n')
+assert m is not None
+assert m.span() == (0, 2)
+assert re.fullmatch(r'ab$', 'ab\n') is None
+assert re.search(r'ab\Z', 'ab\n') is None
+m = re.search(r'ab\Z', 'ab')
+assert m is not None
+assert m.span() == (0, 2)
+# a scoped (?-m:...) group uses the plain $ even under MULTILINE, and inline (?m) the line one
+assert re.findall(r'(?-m:\w+$)', 'ab\ncd\n', re.MULTILINE) == ['cd']
+assert re.findall(r'(?m)\w+$', 'ab\ncd\n') == ['ab', 'cd']
+# a $ in a repeated group
+assert re.findall(r'a(?:$)?', 'aa\n') == ['a', 'a']
+assert re.sub(r'(?:$)+', '!', 'a\n') == 'a!\n!'
+# a $ in a class, escaped or in a comment is not an anchor, but one after an escaped backslash is
+assert re.findall(r'[$]', 'a$b') == ['$']
+assert re.findall(r'\$', 'a$') == ['$']
+assert re.findall(r'a(?#$)b', 'ab') == ['ab']
+assert re.findall(r'\\$', 'a\\\n') == ['\\']
+# the pattern keeps its own text
+assert re.compile(r'x$').pattern == 'x$'
 
 # === More DOTALL tests ===
 # Without DOTALL, . does not match newline

@@ -46,7 +46,9 @@ pub(crate) struct RePattern {
     pattern: String,
     /// Python regex flags bitmask (IGNORECASE=2, MULTILINE=8, DOTALL=16, ASCII=256).
     flags: u16,
-    /// The compiled Rust regex, unanchored.
+    /// The compiled Rust regex, unanchored. Unless `dollar_before_newline`, its `$` outside
+    /// MULTILINE is only the very end of the subject: Python's `$` for any subject that doesn't
+    /// end in `\n` (see `newline_variant`).
     compiled: Regex,
     /// The regex anchored with `\A(?:...)` for `match()`, compiled lazily on first
     /// use (most patterns are only ever `search`/`split`/`sub`ed).
@@ -70,6 +72,13 @@ pub(crate) struct RePattern {
     /// unanchored still fits anchored). `None` = the engine's default limit. Not
     /// serialized — restored patterns recompile at the default limit.
     delegate_size_limit: Option<usize>,
+    /// Whether these regexes read a `$` outside MULTILINE as Python does, also matching before
+    /// a `\n` that ends the subject. Only a `newline_variant` does, since it costs speed.
+    dollar_before_newline: bool,
+    /// The pattern compiled with `dollar_before_newline`, built on first use by a subject that
+    /// ends in `\n` (see [`RePattern::for_subject`]). `None` when the pattern has no `$`
+    /// outside MULTILINE, so its regexes already match like Python for every subject.
+    newline_variant: Option<OnceCell<Box<Self>>>,
 }
 
 impl PartialEq for RePattern {
@@ -99,7 +108,7 @@ impl RePattern {
     ///
     /// Returns `re.PatternError` if the pattern is invalid.
     pub fn compile(pattern: String, flags: u16) -> RunResult<Self> {
-        Self::compile_inner(pattern, flags, None).map_err(ExcType::re_pattern_error)
+        Self::compile_inner(pattern, flags, None, false).map_err(ExcType::re_pattern_error)
     }
 
     /// As [`RePattern::compile`], but caps the compiled size of the delegated regex
@@ -112,7 +121,7 @@ impl RePattern {
         flags: u16,
         delegate_size_limit: usize,
     ) -> Result<Self, BoundedCompileError> {
-        Self::compile_inner(pattern, flags, Some(delegate_size_limit)).map_err(|err| {
+        Self::compile_inner(pattern, flags, Some(delegate_size_limit), false).map_err(|err| {
             if is_size_limit_error(&err) {
                 BoundedCompileError::TooBig
             } else {
@@ -130,9 +139,16 @@ impl RePattern {
         self.flags == flags && self.pattern == pattern
     }
 
-    /// Shared constructor for [`RePattern::compile`] / [`RePattern::compile_bounded`].
-    fn compile_inner(pattern: String, flags: u16, delegate_size_limit: Option<usize>) -> Result<Self, RegexError> {
-        let compiled = compile_regex_limited(&pattern, flags, delegate_size_limit)?;
+    /// Shared constructor for [`RePattern::compile`] / [`RePattern::compile_bounded`], and for
+    /// the `newline_variant` built with `dollar_before_newline`.
+    fn compile_inner(
+        pattern: String,
+        flags: u16,
+        delegate_size_limit: Option<usize>,
+        dollar_before_newline: bool,
+    ) -> Result<Self, RegexError> {
+        let compiled = compile_regex_limited(&pattern, flags, delegate_size_limit, dollar_before_newline)?;
+        let has_dollar = translate_end_anchors(&pattern, flags & MULTILINE != 0, false).1;
         Ok(Self {
             pattern,
             flags,
@@ -140,7 +156,29 @@ impl RePattern {
             compiled_match: OnceCell::new(),
             compiled_fullmatch: OnceCell::new(),
             delegate_size_limit,
+            dollar_before_newline,
+            newline_variant: (has_dollar && !dollar_before_newline).then(OnceCell::new),
         })
+    }
+
+    /// The pattern to match `text` with: `self`, or its `newline_variant` when the subject ends
+    /// in `\n` and the pattern has a `$` outside MULTILINE.
+    ///
+    /// Only then do Python's `$` and `fancy_regex`'s differ, and the variant's `$` is slower.
+    fn for_subject(&self, text: &str) -> RunResult<&Self> {
+        match &self.newline_variant {
+            Some(cell) if text.ends_with('\n') => {
+                if let Some(variant) = cell.get() {
+                    return Ok(variant);
+                }
+                let variant = Self::compile_inner(self.pattern.clone(), self.flags, self.delegate_size_limit, true)
+                    .map_err(ExcType::re_pattern_error)?;
+                // `set` only fails on a concurrent init, impossible on the single-threaded VM.
+                let _ = cell.set(Box::new(variant));
+                Ok(cell.get().expect("cell was just initialised"))
+            }
+            _ => Ok(self),
+        }
     }
 
     /// Returns the `\A(?:pattern)` regex for `match()`, compiling it on first use.
@@ -155,6 +193,7 @@ impl RePattern {
             &format!("\\A(?:{})", self.pattern),
             self.flags,
             self.delegate_size_limit,
+            self.dollar_before_newline,
         )
         .map_err(ExcType::re_pattern_error)?;
         // `set` only fails on a concurrent init, impossible on the single-threaded VM.
@@ -171,6 +210,7 @@ impl RePattern {
             &format!("\\A(?:{})\\z", self.pattern),
             self.flags,
             self.delegate_size_limit,
+            self.dollar_before_newline,
         )
         .map_err(ExcType::re_pattern_error)?;
         let _ = self.compiled_fullmatch.set(compiled);
@@ -190,8 +230,9 @@ impl RePattern {
     /// `subject` is the subject `Value` (stored by the match); `text` is its
     /// borrowed contents. Returns a `ReMatch` heap object, or `Value::None`.
     pub fn search(&self, subject: &Value, text: &str, heap: &Heap) -> RunResult<Value> {
-        match self.compiled.captures(text) {
-            Ok(Some(caps)) => Ok(self.build_match(&caps, subject, text.is_ascii(), heap)),
+        let this = self.for_subject(text)?;
+        match this.compiled.captures(text) {
+            Ok(Some(caps)) => Ok(this.build_match(&caps, subject, text.is_ascii(), heap)),
             Ok(None) => Ok(Value::None),
             Err(err) => Err(ExcType::re_pattern_error(err)),
         }
@@ -205,8 +246,9 @@ impl RePattern {
     ///
     /// Returns a `ReMatch` heap object on success, or `Value::None` if no match.
     pub fn match_start(&self, subject: &Value, text: &str, heap: &Heap) -> RunResult<Value> {
-        match self.match_regex()?.captures(text) {
-            Ok(Some(caps)) => Ok(self.build_match(&caps, subject, text.is_ascii(), heap)),
+        let this = self.for_subject(text)?;
+        match this.match_regex()?.captures(text) {
+            Ok(Some(caps)) => Ok(this.build_match(&caps, subject, text.is_ascii(), heap)),
             Ok(None) => Ok(Value::None),
             Err(err) => Err(ExcType::re_pattern_error(err)),
         }
@@ -220,8 +262,9 @@ impl RePattern {
     ///
     /// Returns a `ReMatch` heap object on success, or `Value::None` if no match.
     pub fn fullmatch(&self, subject: &Value, text: &str, heap: &Heap) -> RunResult<Value> {
-        match self.fullmatch_regex()?.captures(text) {
-            Ok(Some(caps)) => Ok(self.build_match(&caps, subject, text.is_ascii(), heap)),
+        let this = self.for_subject(text)?;
+        match this.fullmatch_regex()?.captures(text) {
+            Ok(Some(caps)) => Ok(this.build_match(&caps, subject, text.is_ascii(), heap)),
             Ok(None) => Ok(Value::None),
             Err(err) => Err(ExcType::re_pattern_error(err)),
         }
@@ -239,13 +282,14 @@ impl RePattern {
     /// values could not release them, since `dec_ref` needs `&mut Heap` while the
     /// match iterator borrows the compiled pattern out of it.
     pub fn findall(&self, text: &str, heap: &Heap) -> RunResult<Value> {
-        let cap_count = self.compiled.captures_len();
+        let compiled = &self.for_subject(text)?.compiled;
+        let cap_count = compiled.captures_len();
 
         match cap_count {
             // No capture groups — return list of full match strings
             0 | 1 => {
                 let mut matches = Vec::new();
-                for m in self.compiled.find_iter(text) {
+                for m in compiled.find_iter(text) {
                     check_slice_growth(&matches, heap)?;
                     matches.push(m.map_err(ExcType::re_pattern_error)?.as_str());
                 }
@@ -254,7 +298,7 @@ impl RePattern {
             // One capture group — return list of the group's strings
             2 => {
                 let mut matches = Vec::new();
-                for caps in self.compiled.captures_iter(text) {
+                for caps in compiled.captures_iter(text) {
                     check_slice_growth(&matches, heap)?;
                     let caps = caps.map_err(ExcType::re_pattern_error)?;
                     matches.push(caps.get(1).map_or("", |m| m.as_str()));
@@ -266,7 +310,7 @@ impl RePattern {
             _ => {
                 let groups = cap_count - 1;
                 let mut flat = Vec::new();
-                for caps in self.compiled.captures_iter(text) {
+                for caps in compiled.captures_iter(text) {
                     let caps = caps.map_err(ExcType::re_pattern_error)?;
                     for cap in caps.iter().skip(1) {
                         check_slice_growth(&flat, heap)?;
@@ -294,10 +338,11 @@ impl RePattern {
         let rust_repl = translate_replacement(repl)?;
         let effective_count = if count == 0 { usize::MAX } else { count };
 
+        let compiled = &self.for_subject(text)?.compiled;
         let mut result = String::new();
         let mut last_end = 0;
 
-        for caps in self.compiled.captures_iter(text).take(effective_count) {
+        for caps in compiled.captures_iter(text).take(effective_count) {
             let caps = caps.map_err(ExcType::re_pattern_error)?;
             let m = caps.get(0).expect("capture group 0 always exists");
             result.push_str(&text[last_end..m.start()]);
@@ -318,14 +363,15 @@ impl RePattern {
     /// element; if it is negative, no splits occur at all (CPython's split loop
     /// runs zero times), returning the whole subject as a single element.
     pub fn split(&self, text: &str, maxsplit: i64, heap: &Heap) -> RunResult<Value> {
+        let compiled = &self.for_subject(text)?.compiled;
         let pieces = match maxsplit.cmp(&0) {
             Ordering::Less => vec![text],
-            Ordering::Equal => collect_slices(self.compiled.split(text), heap)?,
+            Ordering::Equal => collect_slices(compiled.split(text), heap)?,
             Ordering::Greater => {
                 // `maxsplit + 1` pieces = at most `maxsplit` splits; saturate
                 // for absurdly large limits (splitn caps at the piece count).
                 let limit = usize::try_from(maxsplit).unwrap_or(usize::MAX).saturating_add(1);
-                collect_slices(self.compiled.splitn(text, limit), heap)?
+                collect_slices(compiled.splitn(text, limit), heap)?
             }
         };
 
@@ -341,11 +387,12 @@ impl RePattern {
         // Every match shares one refcounted subject reference, not a copy each.
         let all_ascii = text.is_ascii();
 
+        let this = self.for_subject(text)?;
         let mut results = Vec::new();
-        for caps in self.compiled.captures_iter(text) {
+        for caps in this.compiled.captures_iter(text) {
             check_results_growth(&results, heap)?;
             let caps = caps.map_err(ExcType::re_pattern_error)?;
-            results.push(self.build_match(&caps, subject, all_ascii, heap));
+            results.push(this.build_match(&caps, subject, all_ascii, heap));
         }
 
         let list = List::new(results);
@@ -650,6 +697,9 @@ pub(crate) fn extract_count(val: Option<Value>, vm: &mut VM<'_>) -> RunResult<Op
 /// - `re.MULTILINE` (8) → `(?m)` prefix
 /// - `re.DOTALL` (16) → `(?s)` prefix
 ///
+/// and rewrites the end anchors `$` and `\Z`, which mean something else to `fancy_regex`
+/// (see [`translate_end_anchors`]; `$` is only rewritten when `dollar_before_newline`).
+///
 /// `delegate_size_limit` optionally caps the compiled size of the delegated
 /// regex (`RegexBuilder::delegate_size_limit`) — used to bound cached patterns;
 /// `None` uses the engine's default limit.
@@ -659,7 +709,12 @@ pub(crate) fn extract_count(val: Option<Value>, vm: &mut VM<'_>) -> RunResult<Op
 /// Returns the raw `fancy_regex` error so callers can distinguish a size-limit
 /// overflow from an invalid pattern (see [`is_size_limit_error`]) before
 /// converting to `re.PatternError`.
-fn compile_regex_limited(pattern: &str, flags: u16, delegate_size_limit: Option<usize>) -> Result<Regex, RegexError> {
+fn compile_regex_limited(
+    pattern: &str,
+    flags: u16,
+    delegate_size_limit: Option<usize>,
+    dollar_before_newline: bool,
+) -> Result<Regex, RegexError> {
     let mut prefix = String::new();
     if flags & IGNORECASE != 0 {
         prefix.push('i');
@@ -675,8 +730,9 @@ fn compile_regex_limited(pattern: &str, flags: u16, delegate_size_limit: Option<
     // always match Unicode characters. This is a known limitation — Python 3 defaults to
     // Unicode mode anyway, so the behavioral difference only matters for non-ASCII input.
 
+    let (pattern, _) = translate_end_anchors(pattern, flags & MULTILINE != 0, dollar_before_newline);
     let full_pattern = if prefix.is_empty() {
-        pattern.to_owned()
+        pattern.into_owned()
     } else {
         format!("(?{prefix}){pattern}")
     };
@@ -686,6 +742,126 @@ fn compile_regex_limited(pattern: &str, flags: u16, delegate_size_limit: Option<
         builder.delegate_size_limit(limit);
     }
     builder.build()
+}
+
+/// Rewrites a Python pattern's `$` and `\Z` for `fancy_regex`, and reports whether it has a
+/// `$` outside MULTILINE.
+///
+/// Python's `\Z` is the very end, which is `fancy_regex`'s `\z` (its own `\Z` also allows
+/// trailing newlines). Python's `$` outside MULTILINE also matches before a `\n` that ends the
+/// string, where `fancy_regex`'s is only the very end; with `dollar_before_newline` it becomes
+/// `(?=\n?\z)` at the end of the pattern, which `fancy_regex` turns into a plain suffix match,
+/// and `(?:\z|(?=\n\z))` elsewhere, since it won't repeat a bare lookahead as in `(?:$)*`.
+/// Escapes, classes and `(?#...)` comments are copied as they are, and MULTILINE is tracked
+/// through inline and scoped flags.
+fn translate_end_anchors(pattern: &str, multiline: bool, dollar_before_newline: bool) -> (Cow<'_, str>, bool) {
+    if !pattern.contains('$') && !pattern.contains("\\Z") {
+        return (Cow::Borrowed(pattern), false);
+    }
+    let mut out = String::with_capacity(pattern.len() + 16);
+    let mut multiline = multiline;
+    let mut has_dollar = false;
+    // MULTILINE as it was outside each open group, restored at its `)`
+    let mut outer = Vec::new();
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next() {
+                Some('Z') => out.push_str("\\z"),
+                Some(escaped) => {
+                    out.push('\\');
+                    out.push(escaped);
+                }
+                None => out.push('\\'),
+            },
+            '[' => copy_class(&mut chars, &mut out),
+            '(' => {
+                out.push('(');
+                if chars.next_if_eq(&'?').is_some() {
+                    out.push('?');
+                    if chars.next_if_eq(&'#').is_some() {
+                        // a comment runs to the next `)`
+                        out.push('#');
+                        for c in chars.by_ref() {
+                            out.push(c);
+                            if c == ')' {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                    if let Some((text, scoped, sets_multiline)) = inline_flags(&chars) {
+                        chars.nth(text.chars().count() - 1);
+                        out.push_str(&text);
+                        if scoped {
+                            outer.push(multiline);
+                        }
+                        multiline = sets_multiline.unwrap_or(multiline);
+                        continue;
+                    }
+                }
+                outer.push(multiline);
+            }
+            ')' => {
+                out.push(')');
+                multiline = outer.pop().unwrap_or(multiline);
+            }
+            '$' if !multiline => {
+                has_dollar = true;
+                out.push_str(match (dollar_before_newline, chars.peek()) {
+                    (false, _) => "$",
+                    (true, None) => "(?=\\n?\\z)",
+                    (true, Some(_)) => "(?:\\z|(?=\\n\\z))",
+                });
+            }
+            _ => out.push(c),
+        }
+    }
+    (Cow::Owned(out), has_dollar)
+}
+
+/// Copies a character class through its closing `]`, just past the opening `[`.
+///
+/// A `]` straight after `[` or `[^` is a literal, as in Python, and so is anything escaped.
+fn copy_class(chars: &mut iter::Peekable<str::Chars<'_>>, out: &mut String) {
+    out.push('[');
+    if chars.next_if_eq(&'^').is_some() {
+        out.push('^');
+    }
+    if chars.next_if_eq(&']').is_some() {
+        out.push(']');
+    }
+    while let Some(c) = chars.next() {
+        out.push(c);
+        match c {
+            '\\' => out.extend(chars.next()),
+            ']' => return,
+            _ => {}
+        }
+    }
+}
+
+/// Reads the flags of an inline `(?ims)` or scoped `(?i-m:...)` group from just past its `(?`,
+/// without consuming them.
+///
+/// Returns the text through the closing `)` or `:`, whether the group is scoped, and what it
+/// sets MULTILINE to (`None` if it leaves it alone); `None` for any other `(?` construct.
+fn inline_flags(chars: &iter::Peekable<str::Chars<'_>>) -> Option<(String, bool, Option<bool>)> {
+    let mut ahead = chars.clone();
+    let mut text = String::new();
+    let mut turning_on = true;
+    let mut sets_multiline = None;
+    loop {
+        let c = ahead.next()?;
+        text.push(c);
+        match c {
+            ')' | ':' => return Some((text, c == ':', sets_multiline)),
+            '-' if turning_on => turning_on = false,
+            'm' => sets_multiline = Some(turning_on),
+            'a' | 'i' | 'L' | 's' | 'u' | 'x' => {}
+            _ => return None,
+        }
+    }
 }
 
 /// True when `err` is the delegated engine's exceeded-size-limit error: the
