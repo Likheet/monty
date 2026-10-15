@@ -396,7 +396,11 @@ fn check_results_growth(results: &Vec<Value>, heap: &Heap) -> RunResult<()> {
 
 /// [`check_results_growth`] for a buffer of borrowed match slices (`&str`, or
 /// `Option<&str>` where a split's group may be missing).
+///
+/// Also polls the time limit, amortized with `check_time_every`: no instruction
+/// checkpoint can stop the scan that fills the buffer either.
 fn check_slice_growth<T>(slices: &Vec<T>, heap: &Heap) -> RunResult<()> {
+    heap.tracker.check_time_every(slices.len())?;
     Ok(heap
         .tracker
         .check_growth(slices.len(), slices.capacity(), mem::size_of::<T>())?)
