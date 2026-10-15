@@ -194,6 +194,34 @@ assert re.findall(r'a(?#$)b', 'ab') == ['ab']
 assert re.findall(r'\\$', 'a\\\n') == ['\\']
 # the pattern keeps its own text
 assert re.compile(r'x$').pattern == 'x$'
+# a final $ applying to the whole pattern, as match() and fullmatch() see it
+m = re.match(r'(\d+)$', '123\n')
+assert m is not None
+assert m.span(1) == (0, 3)
+assert re.match(r'\d+$', '12a\n') is None
+m = re.match(r'\d+$', '12\n34\n', re.MULTILINE)
+assert m is not None
+assert m.group() == '12'
+# a final $ applying only to the last alternative
+m = re.match(r'a|b$', 'ab\n')
+assert m is not None
+assert m.group() == 'a'
+assert re.match(r'a|b$', 'bc\n') is None
+m = re.fullmatch(r'a|b$', 'b')
+assert m is not None
+assert re.fullmatch(r'a|b$', 'b\n') is None
+# a $ ending an alternative of a lookahead
+assert re.findall(r'\w+(?=,|$)', 'one,two three\n') == ['one', 'three']
+assert re.findall(r'\w(?!$)', 'ab\n') == ['a']
+m = re.search(r'a(?=(b|$))', 'a\n')
+assert m is not None
+assert m.group(1) == ''
+assert re.findall(r'\w+(?=,|$)', 'word ' * 50_000 + 'end\n') == ['end']
+# a VERBOSE comment can hold a `)`
+assert re.findall('(?xm)(?-m:a # )\n$)', 'a\n') == ['a']
+m = re.search('(?x)a(?=(b # )\n|$))', 'a\n')
+assert m is not None
+assert m.group(1) == ''
 
 # === More DOTALL tests ===
 # Without DOTALL, . does not match newline

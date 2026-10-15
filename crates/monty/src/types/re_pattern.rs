@@ -33,7 +33,7 @@ use crate::{
 
 /// A compiled regular expression pattern.
 ///
-/// Wraps a `fancy_regex::Regex` with the original Python pattern string and flags.
+/// Wraps `fancy_regex::Regex`es with the original Python pattern string and flags.
 /// The `fancy_regex` crate supports backtracking features like backreferences and
 /// lookaround, but this means patterns are susceptible to ReDoS — Monty's resource
 /// limits are the defense against catastrophic backtracking.
@@ -46,9 +46,35 @@ pub(crate) struct RePattern {
     pattern: String,
     /// Python regex flags bitmask (IGNORECASE=2, MULTILINE=8, DOTALL=16, ASCII=256).
     flags: u16,
-    /// The compiled Rust regex, unanchored. Unless `dollar_before_newline`, its `$` outside
-    /// MULTILINE is only the very end of the subject: Python's `$` for any subject that doesn't
-    /// end in `\n` (see `newline_variant`).
+    /// The `delegate_size_limit` every regex here is compiled with, so a *cached* entry stays
+    /// bounded; `fancy_regex` applies it to each delegated sub-regex, not each regex. `None` =
+    /// the engine's default limit. Not serialized — restored patterns recompile at the default.
+    delegate_size_limit: Option<usize>,
+    /// Where the pattern's final `$` sits, which decides how `match()`/`fullmatch()` wrap it.
+    trailing_dollar: TrailingDollar,
+    /// The regexes for a subject that doesn't end in `\n`, where `fancy_regex`'s `$` is Python's.
+    regexes: CompiledSet,
+    /// The regexes for a subject ending in `\n`, whose `$` outside MULTILINE also matches before
+    /// that `\n`, built on first use. `None` when the pattern has no such `$`.
+    newline_regexes: Option<OnceCell<CompiledSet>>,
+}
+
+impl PartialEq for RePattern {
+    fn eq(&self, other: &Self) -> bool {
+        self.pattern == other.pattern && self.flags == other.flags
+    }
+}
+
+/// The regexes for one reading of `$`: the unanchored one, and the anchored ones that
+/// `match()`/`fullmatch()` compile on first use (see [`RePattern::match_regex`]).
+///
+/// [`RePattern`] holds a second set for subjects ending in `\n`, as only those need Python's
+/// slower `$`, so a cached entry can retain six regexes.
+#[derive(Debug, Clone)]
+struct CompiledSet {
+    /// Whether `$` outside MULTILINE also matches before a `\n` that ends the subject.
+    dollar_before_newline: bool,
+    /// The unanchored regex, for everything but `match()` and `fullmatch()`.
     compiled: Regex,
     /// The regex anchored with `\A(?:...)` for `match()`, compiled lazily on first
     /// use (most patterns are only ever `search`/`split`/`sub`ed).
@@ -66,24 +92,17 @@ pub(crate) struct RePattern {
     /// alternations — e.g. `fullmatch('a|ab', 'ab')` must match `ab`, not fail
     /// because the engine found `a` first.
     compiled_fullmatch: OnceCell<Regex>,
-    /// The `delegate_size_limit` the plain regex was compiled with, forwarded to
-    /// the anchored variants above so a *cached* entry's total retained compiled
-    /// size stays bounded (the anchors add only O(1) bytes, so a pattern that fit
-    /// unanchored still fits anchored). `None` = the engine's default limit. Not
-    /// serialized — restored patterns recompile at the default limit.
-    delegate_size_limit: Option<usize>,
-    /// Whether these regexes read a `$` outside MULTILINE as Python does, also matching before
-    /// a `\n` that ends the subject. Only a `newline_variant` does, since it costs speed.
-    dollar_before_newline: bool,
-    /// The pattern compiled with `dollar_before_newline`, built on first use by a subject that
-    /// ends in `\n` (see [`RePattern::for_subject`]). `None` when the pattern has no `$`
-    /// outside MULTILINE, so its regexes already match like Python for every subject.
-    newline_variant: Option<OnceCell<Box<Self>>>,
 }
 
-impl PartialEq for RePattern {
-    fn eq(&self, other: &Self) -> bool {
-        self.pattern == other.pattern && self.flags == other.flags
+impl CompiledSet {
+    /// A set around its compiled unanchored regex, with the anchored ones still to compile.
+    fn new(compiled: Regex, dollar_before_newline: bool) -> Self {
+        Self {
+            dollar_before_newline,
+            compiled,
+            compiled_match: OnceCell::new(),
+            compiled_fullmatch: OnceCell::new(),
+        }
     }
 }
 
@@ -108,20 +127,20 @@ impl RePattern {
     ///
     /// Returns `re.PatternError` if the pattern is invalid.
     pub fn compile(pattern: String, flags: u16) -> RunResult<Self> {
-        Self::compile_inner(pattern, flags, None, false).map_err(ExcType::re_pattern_error)
+        Self::compile_inner(pattern, flags, None).map_err(ExcType::re_pattern_error)
     }
 
-    /// As [`RePattern::compile`], but caps the compiled size of the delegated regex
+    /// As [`RePattern::compile`], but caps the compiled size of the delegated regexes
     /// (`RegexBuilder::delegate_size_limit`) so the `re` module's pattern cache can
-    /// retain entries with a hard per-entry memory ceiling. The limit is retained
-    /// and applied to the lazily-compiled anchored `match`/`fullmatch` variants
-    /// too, so a cached entry cannot pin large regexes via `.match()`/`.fullmatch()`.
+    /// bound the memory its entries retain. The limit is retained and applied to the
+    /// regexes compiled lazily (see [`RePattern::compile_lazily`]) too, so a cached entry
+    /// cannot pin large regexes via `.match()`/`.fullmatch()`.
     pub(crate) fn compile_bounded(
         pattern: String,
         flags: u16,
         delegate_size_limit: usize,
     ) -> Result<Self, BoundedCompileError> {
-        Self::compile_inner(pattern, flags, Some(delegate_size_limit), false).map_err(|err| {
+        Self::compile_inner(pattern, flags, Some(delegate_size_limit)).map_err(|err| {
             if is_size_limit_error(&err) {
                 BoundedCompileError::TooBig
             } else {
@@ -139,89 +158,103 @@ impl RePattern {
         self.flags == flags && self.pattern == pattern
     }
 
-    /// Shared constructor for [`RePattern::compile`] / [`RePattern::compile_bounded`], and for
-    /// the `newline_variant` built with `dollar_before_newline`.
-    fn compile_inner(
-        pattern: String,
-        flags: u16,
-        delegate_size_limit: Option<usize>,
-        dollar_before_newline: bool,
-    ) -> Result<Self, RegexError> {
-        let compiled = compile_regex_limited(&pattern, flags, delegate_size_limit, dollar_before_newline)?;
-        let has_dollar = translate_end_anchors(&pattern, flags & MULTILINE != 0, false).1;
+    /// Shared constructor for [`RePattern::compile`] / [`RePattern::compile_bounded`].
+    ///
+    /// Only the regex for subjects that don't end in `\n` is compiled here: the
+    /// others wait for a call that needs them.
+    fn compile_inner(pattern: String, flags: u16, delegate_size_limit: Option<usize>) -> Result<Self, RegexError> {
+        let (compiled, anchors) = compile_regex_limited(&pattern, flags, delegate_size_limit, false)?;
         Ok(Self {
             pattern,
             flags,
-            compiled,
-            compiled_match: OnceCell::new(),
-            compiled_fullmatch: OnceCell::new(),
             delegate_size_limit,
-            dollar_before_newline,
-            newline_variant: (has_dollar && !dollar_before_newline).then(OnceCell::new),
+            trailing_dollar: anchors.trailing_dollar,
+            regexes: CompiledSet::new(compiled, false),
+            newline_regexes: anchors.has_dollar.then(OnceCell::new),
         })
     }
 
-    /// The pattern to match `text` with: `self`, or its `newline_variant` when the subject ends
-    /// in `\n` and the pattern has a `$` outside MULTILINE.
+    /// The regexes to match `text` with: the `newline_regexes` when it ends in `\n` and the
+    /// pattern has a `$` outside MULTILINE, compiling them on first use, else `regexes`.
     ///
-    /// Only then do Python's `$` and `fancy_regex`'s differ, and the variant's `$` is slower.
-    fn for_subject(&self, text: &str) -> RunResult<&Self> {
-        match &self.newline_variant {
+    /// Only then do Python's `$` and `fancy_regex`'s differ, and the newline regexes are slower.
+    fn for_subject(&self, text: &str) -> RunResult<&CompiledSet> {
+        match &self.newline_regexes {
             Some(cell) if text.ends_with('\n') => {
-                if let Some(variant) = cell.get() {
-                    return Ok(variant);
+                if let Some(regexes) = cell.get() {
+                    return Ok(regexes);
                 }
-                let variant = Self::compile_inner(self.pattern.clone(), self.flags, self.delegate_size_limit, true)
-                    .map_err(ExcType::re_pattern_error)?;
+                let compiled = self.compile_lazily(&self.pattern, true)?;
                 // `set` only fails on a concurrent init, impossible on the single-threaded VM.
-                let _ = cell.set(Box::new(variant));
+                let _ = cell.set(CompiledSet::new(compiled, true));
                 Ok(cell.get().expect("cell was just initialised"))
             }
-            _ => Ok(self),
+            _ => Ok(&self.regexes),
         }
     }
 
-    /// Returns the `\A(?:pattern)` regex for `match()`, compiling it on first use.
+    /// Returns the `\A(?:pattern)` regex of `regexes` for `match()`, compiling it on first use.
     ///
-    /// Wrapping a pattern that already compiled essentially never fails, so any
-    /// error surfaces (as `re.PatternError`) at `match()` rather than `re.compile()`.
-    fn match_regex(&self) -> RunResult<&Regex> {
-        if let Some(regex) = self.compiled_match.get() {
+    /// A final `$` that applies to the whole pattern goes after the group instead, so it stays a
+    /// trailing lookahead, which `fancy_regex` runs on its linear engine (see [`TrailingDollar`]).
+    fn match_regex<'a>(&self, regexes: &'a CompiledSet) -> RunResult<&'a Regex> {
+        if let Some(regex) = regexes.compiled_match.get() {
             return Ok(regex);
         }
-        let compiled = compile_regex_limited(
-            &format!("\\A(?:{})", self.pattern),
-            self.flags,
-            self.delegate_size_limit,
-            self.dollar_before_newline,
-        )
-        .map_err(ExcType::re_pattern_error)?;
+        let source = match self.trailing_dollar {
+            TrailingDollar::WholePattern => format!("\\A(?:{})$", self.without_trailing_dollar()),
+            TrailingDollar::None | TrailingDollar::LastAlternative => format!("\\A(?:{})", self.pattern),
+        };
+        let compiled = self.compile_lazily(&source, regexes.dollar_before_newline)?;
         // `set` only fails on a concurrent init, impossible on the single-threaded VM.
-        let _ = self.compiled_match.set(compiled);
-        Ok(self.compiled_match.get().expect("cell was just initialised"))
+        let _ = regexes.compiled_match.set(compiled);
+        Ok(regexes.compiled_match.get().expect("cell was just initialised"))
     }
 
-    /// Returns the `\A(?:pattern)\z` regex for `fullmatch()`, compiling on first use.
-    fn fullmatch_regex(&self) -> RunResult<&Regex> {
-        if let Some(regex) = self.compiled_fullmatch.get() {
+    /// Returns the `\A(?:pattern)\z` regex of `regexes` for `fullmatch()`, compiling on first use.
+    ///
+    /// A final `$` outside every group is dropped: just before `\z` it always holds, and kept
+    /// it would put the regex on `fancy_regex`'s backtracking VM.
+    fn fullmatch_regex<'a>(&self, regexes: &'a CompiledSet) -> RunResult<&'a Regex> {
+        if let Some(regex) = regexes.compiled_fullmatch.get() {
             return Ok(regex);
         }
-        let compiled = compile_regex_limited(
-            &format!("\\A(?:{})\\z", self.pattern),
-            self.flags,
-            self.delegate_size_limit,
-            self.dollar_before_newline,
-        )
-        .map_err(ExcType::re_pattern_error)?;
-        let _ = self.compiled_fullmatch.set(compiled);
-        Ok(self.compiled_fullmatch.get().expect("cell was just initialised"))
+        let body = match self.trailing_dollar {
+            TrailingDollar::None => self.pattern.as_str(),
+            TrailingDollar::WholePattern | TrailingDollar::LastAlternative => self.without_trailing_dollar(),
+        };
+        let compiled = self.compile_lazily(&format!("\\A(?:{body})\\z"), regexes.dollar_before_newline)?;
+        let _ = regexes.compiled_fullmatch.set(compiled);
+        Ok(regexes.compiled_fullmatch.get().expect("cell was just initialised"))
+    }
+
+    /// The pattern without the final `$` that `trailing_dollar` records.
+    fn without_trailing_dollar(&self) -> &str {
+        &self.pattern[..self.pattern.len() - 1]
+    }
+
+    /// Compiles `source`, the pattern or an anchored form of it, for a regex built on first use.
+    ///
+    /// These forms can be a little bigger than the regex [`RePattern::compile_bounded`] checked,
+    /// so one over the cache's size cap is compiled at the default limit, not failed as invalid.
+    fn compile_lazily(&self, source: &str, dollar_before_newline: bool) -> RunResult<Regex> {
+        let compiled = match compile_regex_limited(source, self.flags, self.delegate_size_limit, dollar_before_newline)
+        {
+            Err(err) if self.delegate_size_limit.is_some() && is_size_limit_error(&err) => {
+                compile_regex_limited(source, self.flags, None, dollar_before_newline)
+            }
+            result => result,
+        };
+        compiled.map(|(regex, _)| regex).map_err(ExcType::re_pattern_error)
     }
 
     /// Builds a single `ReMatch` heap value from a capture result, keeping the
     /// subject alive by refcount (`subject.clone_with_heap`) rather than copying
     /// its text. `all_ascii` is precomputed by the caller (once per `finditer`).
+    ///
+    /// Every regex of the pattern has the same groups, so `regexes.compiled` names them.
     fn build_match(&self, caps: &fancy_regex::Captures<'_>, subject: &Value, all_ascii: bool, heap: &Heap) -> Value {
-        let m = ReMatch::from_captures(caps, subject.clone_with_heap(heap), all_ascii, &self.compiled);
+        let m = ReMatch::from_captures(caps, subject.clone_with_heap(heap), all_ascii, &self.regexes.compiled);
         Value::Ref(heap.allocate(HeapData::ReMatch(Box::new(m))))
     }
 
@@ -230,9 +263,8 @@ impl RePattern {
     /// `subject` is the subject `Value` (stored by the match); `text` is its
     /// borrowed contents. Returns a `ReMatch` heap object, or `Value::None`.
     pub fn search(&self, subject: &Value, text: &str, heap: &Heap) -> RunResult<Value> {
-        let this = self.for_subject(text)?;
-        match this.compiled.captures(text) {
-            Ok(Some(caps)) => Ok(this.build_match(&caps, subject, text.is_ascii(), heap)),
+        match self.for_subject(text)?.compiled.captures(text) {
+            Ok(Some(caps)) => Ok(self.build_match(&caps, subject, text.is_ascii(), heap)),
             Ok(None) => Ok(Value::None),
             Err(err) => Err(ExcType::re_pattern_error(err)),
         }
@@ -246,9 +278,8 @@ impl RePattern {
     ///
     /// Returns a `ReMatch` heap object on success, or `Value::None` if no match.
     pub fn match_start(&self, subject: &Value, text: &str, heap: &Heap) -> RunResult<Value> {
-        let this = self.for_subject(text)?;
-        match this.match_regex()?.captures(text) {
-            Ok(Some(caps)) => Ok(this.build_match(&caps, subject, text.is_ascii(), heap)),
+        match self.match_regex(self.for_subject(text)?)?.captures(text) {
+            Ok(Some(caps)) => Ok(self.build_match(&caps, subject, text.is_ascii(), heap)),
             Ok(None) => Ok(Value::None),
             Err(err) => Err(ExcType::re_pattern_error(err)),
         }
@@ -262,9 +293,8 @@ impl RePattern {
     ///
     /// Returns a `ReMatch` heap object on success, or `Value::None` if no match.
     pub fn fullmatch(&self, subject: &Value, text: &str, heap: &Heap) -> RunResult<Value> {
-        let this = self.for_subject(text)?;
-        match this.fullmatch_regex()?.captures(text) {
-            Ok(Some(caps)) => Ok(this.build_match(&caps, subject, text.is_ascii(), heap)),
+        match self.fullmatch_regex(self.for_subject(text)?)?.captures(text) {
+            Ok(Some(caps)) => Ok(self.build_match(&caps, subject, text.is_ascii(), heap)),
             Ok(None) => Ok(Value::None),
             Err(err) => Err(ExcType::re_pattern_error(err)),
         }
@@ -387,12 +417,12 @@ impl RePattern {
         // Every match shares one refcounted subject reference, not a copy each.
         let all_ascii = text.is_ascii();
 
-        let this = self.for_subject(text)?;
+        let compiled = &self.for_subject(text)?.compiled;
         let mut results = Vec::new();
-        for caps in this.compiled.captures_iter(text) {
+        for caps in compiled.captures_iter(text) {
             check_results_growth(&results, heap)?;
             let caps = caps.map_err(ExcType::re_pattern_error)?;
-            results.push(this.build_match(&caps, subject, all_ascii, heap));
+            results.push(self.build_match(&caps, subject, all_ascii, heap));
         }
 
         let list = List::new(results);
@@ -699,9 +729,10 @@ pub(crate) fn extract_count(val: Option<Value>, vm: &mut VM<'_>) -> RunResult<Op
 ///
 /// and rewrites the end anchors `$` and `\Z`, which mean something else to `fancy_regex`
 /// (see [`translate_end_anchors`]; `$` is only rewritten when `dollar_before_newline`).
+/// Returns the regex with what the rewrite found out about the pattern's `$`s.
 ///
 /// `delegate_size_limit` optionally caps the compiled size of the delegated
-/// regex (`RegexBuilder::delegate_size_limit`) — used to bound cached patterns;
+/// regexes (`RegexBuilder::delegate_size_limit`) — used to bound cached patterns;
 /// `None` uses the engine's default limit.
 ///
 /// # Errors
@@ -714,7 +745,7 @@ fn compile_regex_limited(
     flags: u16,
     delegate_size_limit: Option<usize>,
     dollar_before_newline: bool,
-) -> Result<Regex, RegexError> {
+) -> Result<(Regex, EndAnchors), RegexError> {
     let mut prefix = String::new();
     if flags & IGNORECASE != 0 {
         prefix.push('i');
@@ -730,7 +761,7 @@ fn compile_regex_limited(
     // always match Unicode characters. This is a known limitation — Python 3 defaults to
     // Unicode mode anyway, so the behavioral difference only matters for non-ASCII input.
 
-    let (pattern, _) = translate_end_anchors(pattern, flags & MULTILINE != 0, dollar_before_newline);
+    let (pattern, anchors) = translate_end_anchors(pattern, flags & MULTILINE != 0, dollar_before_newline);
     let full_pattern = if prefix.is_empty() {
         pattern.into_owned()
     } else {
@@ -741,28 +772,58 @@ fn compile_regex_limited(
     if let Some(limit) = delegate_size_limit {
         builder.delegate_size_limit(limit);
     }
-    builder.build()
+    builder.build().map(|regex| (regex, anchors))
 }
 
-/// Rewrites a Python pattern's `$` and `\Z` for `fancy_regex`, and reports whether it has a
-/// `$` outside MULTILINE.
+/// What [`translate_end_anchors`] found out about a pattern's `$`s outside MULTILINE.
+#[derive(Debug, Clone, Copy, Default)]
+struct EndAnchors {
+    /// Whether it has one, which `fancy_regex` reads differently for a subject ending in `\n`.
+    has_dollar: bool,
+    /// Whether and how one ends the pattern.
+    trailing_dollar: TrailingDollar,
+}
+
+/// Whether and how a `$` outside MULTILINE ends a pattern, outside every group.
+///
+/// Wrapped in `\A(?:...)`, such a `$` no longer ends the pattern, and `fancy_regex` runs a
+/// lookahead on its linear engine only there, so `match()` moves one that applies to the whole
+/// pattern after the wrapper, and `fullmatch()` drops it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum TrailingDollar {
+    /// The pattern doesn't end in one.
+    #[default]
+    None,
+    /// It does, and the `$` applies to the whole pattern.
+    WholePattern,
+    /// It does after a top-level `|`, so the `$` applies to the last alternative only.
+    LastAlternative,
+}
+
+/// Rewrites a Python pattern's `$` and `\Z` for `fancy_regex`, and reports what it found out
+/// about the `$`s outside MULTILINE.
 ///
 /// Python's `\Z` is the very end, which is `fancy_regex`'s `\z` (its own `\Z` also allows
 /// trailing newlines). Python's `$` outside MULTILINE also matches before a `\n` that ends the
 /// string, where `fancy_regex`'s is only the very end; with `dollar_before_newline` it becomes
 /// `(?=\n?\z)` at the end of the pattern, which `fancy_regex` turns into a plain suffix match,
-/// and `(?:\z|(?=\n\z))` elsewhere, since it won't repeat a bare lookahead as in `(?:$)*`.
-/// Escapes, classes and `(?#...)` comments are copied as they are, and MULTILINE is tracked
-/// through inline and scoped flags.
-fn translate_end_anchors(pattern: &str, multiline: bool, dollar_before_newline: bool) -> (Cow<'_, str>, bool) {
+/// `\n?\z` where it ends an alternative of a lookahead, which is zero-width already, and
+/// `(?:\z|(?=\n\z))` elsewhere, since it won't repeat a bare lookahead as in `(?:$)*`.
+/// Escapes, classes and comments are copied as they are, and MULTILINE and VERBOSE are
+/// tracked through inline and scoped flags.
+fn translate_end_anchors(pattern: &str, multiline: bool, dollar_before_newline: bool) -> (Cow<'_, str>, EndAnchors) {
     if !pattern.contains('$') && !pattern.contains("\\Z") {
-        return (Cow::Borrowed(pattern), false);
+        return (Cow::Borrowed(pattern), EndAnchors::default());
     }
     let mut out = String::with_capacity(pattern.len() + 16);
-    let mut multiline = multiline;
-    let mut has_dollar = false;
-    // MULTILINE as it was outside each open group, restored at its `)`
-    let mut outer = Vec::new();
+    let mut anchors = EndAnchors::default();
+    let mut scope = Scope {
+        multiline,
+        verbose: false,
+    };
+    // the flags outside each open group, restored at its `)`, and whether it is a lookahead
+    let mut open: Vec<(Scope, bool)> = Vec::new();
+    let mut top_level_alternation = false;
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
@@ -775,8 +836,19 @@ fn translate_end_anchors(pattern: &str, multiline: bool, dollar_before_newline: 
                 None => out.push('\\'),
             },
             '[' => copy_class(&mut chars, &mut out),
+            '#' if scope.verbose => {
+                // a verbose comment runs to the end of the line
+                out.push('#');
+                for c in chars.by_ref() {
+                    out.push(c);
+                    if c == '\n' {
+                        break;
+                    }
+                }
+            }
             '(' => {
                 out.push('(');
+                let mut lookahead = false;
                 if chars.next_if_eq(&'?').is_some() {
                     out.push('?');
                     if chars.next_if_eq(&'#').is_some() {
@@ -790,34 +862,60 @@ fn translate_end_anchors(pattern: &str, multiline: bool, dollar_before_newline: 
                         }
                         continue;
                     }
-                    if let Some((text, scoped, sets_multiline)) = inline_flags(&chars) {
+                    if let Some((text, scoped, inner)) = inline_flags(&chars, scope) {
                         chars.nth(text.chars().count() - 1);
                         out.push_str(&text);
                         if scoped {
-                            outer.push(multiline);
+                            open.push((scope, false));
                         }
-                        multiline = sets_multiline.unwrap_or(multiline);
+                        scope = inner;
                         continue;
                     }
+                    lookahead = matches!(chars.peek(), Some('=' | '!'));
                 }
-                outer.push(multiline);
+                open.push((scope, lookahead));
             }
             ')' => {
                 out.push(')');
-                multiline = outer.pop().unwrap_or(multiline);
+                scope = open.pop().map_or(scope, |(outer, _)| outer);
             }
-            '$' if !multiline => {
-                has_dollar = true;
-                out.push_str(match (dollar_before_newline, chars.peek()) {
+            '|' => {
+                top_level_alternation |= open.is_empty();
+                out.push('|');
+            }
+            '$' if !scope.multiline => {
+                anchors.has_dollar = true;
+                let next = chars.peek().copied();
+                // moved out of a `match()` wrapper, the `$` must still be outside MULTILINE
+                if next.is_none() && open.is_empty() && !multiline {
+                    anchors.trailing_dollar = if top_level_alternation {
+                        TrailingDollar::LastAlternative
+                    } else {
+                        TrailingDollar::WholePattern
+                    };
+                }
+                let ends_lookahead_alternative =
+                    matches!(next, Some('|' | ')')) && open.last().is_some_and(|&(_, lookahead)| lookahead);
+                out.push_str(match (dollar_before_newline, next) {
                     (false, _) => "$",
                     (true, None) => "(?=\\n?\\z)",
+                    (true, Some(_)) if ends_lookahead_alternative => "\\n?\\z",
                     (true, Some(_)) => "(?:\\z|(?=\\n\\z))",
                 });
             }
             _ => out.push(c),
         }
     }
-    (Cow::Owned(out), has_dollar)
+    (Cow::Owned(out), anchors)
+}
+
+/// The flags at a point of a pattern that [`translate_end_anchors`] needs to follow.
+#[derive(Debug, Clone, Copy)]
+struct Scope {
+    /// MULTILINE, under which `$` is a line end that needs no rewriting.
+    multiline: bool,
+    /// VERBOSE, under which `#` starts a comment that runs to the end of the line.
+    verbose: bool,
 }
 
 /// Copies a character class through its closing `]`, just past the opening `[`.
@@ -841,24 +939,25 @@ fn copy_class(chars: &mut iter::Peekable<str::Chars<'_>>, out: &mut String) {
     }
 }
 
-/// Reads the flags of an inline `(?ims)` or scoped `(?i-m:...)` group from just past its `(?`,
+/// Reads the flags of an inline `(?imx)` or scoped `(?i-m:...)` group from just past its `(?`,
 /// without consuming them.
 ///
-/// Returns the text through the closing `)` or `:`, whether the group is scoped, and what it
-/// sets MULTILINE to (`None` if it leaves it alone); `None` for any other `(?` construct.
-fn inline_flags(chars: &iter::Peekable<str::Chars<'_>>) -> Option<(String, bool, Option<bool>)> {
+/// Returns the text through the closing `)` or `:`, whether the group is scoped, and `scope`
+/// with the group's MULTILINE and VERBOSE applied; `None` for any other `(?` construct.
+fn inline_flags(chars: &iter::Peekable<str::Chars<'_>>, scope: Scope) -> Option<(String, bool, Scope)> {
     let mut ahead = chars.clone();
     let mut text = String::new();
     let mut turning_on = true;
-    let mut sets_multiline = None;
+    let mut scope = scope;
     loop {
         let c = ahead.next()?;
         text.push(c);
         match c {
-            ')' | ':' => return Some((text, c == ':', sets_multiline)),
+            ')' | ':' => return Some((text, c == ':', scope)),
             '-' if turning_on => turning_on = false,
-            'm' => sets_multiline = Some(turning_on),
-            'a' | 'i' | 'L' | 's' | 'u' | 'x' => {}
+            'm' => scope.multiline = turning_on,
+            'x' => scope.verbose = turning_on,
+            'a' | 'i' | 'L' | 's' | 'u' => {}
             _ => return None,
         }
     }
