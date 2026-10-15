@@ -290,9 +290,14 @@ pub struct Compiler<'a, 'i> {
 
     /// Settings for this scope and its nested compilers.
     flags: ScopeFlags,
+
+    /// Position of the outermost comprehension whose body is being compiled. In CPython,
+    /// everything after the first iterator runs in the comprehension's own scope, so an
+    /// `await` there makes the comprehension asynchronous.
+    comprehension_position: Option<CodeRange>,
 }
 
-/// Compiler settings inherited by nested scopes, with await restrictions reset for functions.
+/// Compiler settings inherited by nested scopes, with the `await` rule set again for functions.
 #[derive(Debug, Clone, Copy)]
 struct ScopeFlags {
     /// Whether to compile pytest-style assert failure annotations.
@@ -301,9 +306,20 @@ struct ScopeFlags {
     /// `NAME_GLOBAL_ONLY`) because the running frame's globals are an explicit
     /// `exec()` / `eval()` dict.
     globals_by_name: bool,
-    /// Rejects `await` at snippet top level and in its class bodies.
-    /// Nested function bodies reset this restriction.
-    forbid_await: bool,
+    /// Whether `await` is allowed here. Nested function bodies set their own rule.
+    await_rule: AwaitRule,
+}
+
+/// Where `await` is allowed, and CPython's error for it where it is not.
+#[derive(Debug, Clone, Copy)]
+enum AwaitRule {
+    /// Module top level (top-level await) and `async def` bodies.
+    Allowed,
+    /// Snippet top level and its class bodies, and class bodies in a sync function:
+    /// `'await' outside function`.
+    OutsideFunction,
+    /// The body of a `def` or `lambda` that is not `async`: `'await' outside async function`.
+    OutsideAsyncFunction,
 }
 
 /// Jump targets needed to compile `break` and `continue`.
@@ -526,6 +542,7 @@ impl<'a, 'i> Compiler<'a, 'i> {
             frame_locals,
             comp_slots: Vec::new(),
             flags,
+            comprehension_position: None,
         }
     }
 
@@ -568,7 +585,11 @@ impl<'a, 'i> Compiler<'a, 'i> {
         let flags = ScopeFlags {
             assert_message_annotations: options.assert_message_annotations.enabled(),
             globals_by_name: snippet.unwrap_or(false),
-            forbid_await: snippet.is_some(),
+            await_rule: if snippet.is_some() {
+                AwaitRule::OutsideFunction
+            } else {
+                AwaitRule::Allowed
+            },
         };
         let mut compiler = Compiler::new(interns, true, 0, flags);
 
@@ -599,7 +620,11 @@ impl<'a, 'i> Compiler<'a, 'i> {
         // comp-var load/store opcodes use `num_locals + offset` to skip past
         // the locals region into the operand-stack region.
         let flags = ScopeFlags {
-            forbid_await: false,
+            await_rule: if func_def.is_async {
+                AwaitRule::Allowed
+            } else {
+                AwaitRule::OutsideAsyncFunction
+            },
             ..flags
         };
         let mut compiler = Compiler::new(interns, false, num_locals, flags);
@@ -1015,7 +1040,15 @@ impl<'a, 'i> Compiler<'a, 'i> {
         class_name: &Identifier,
         position: CodeRange,
     ) -> Result<(), CompileError> {
-        let flags = self.flags;
+        // A class body is not a function, so in a sync function CPython reports
+        // `'await' outside function` for it.
+        let flags = ScopeFlags {
+            await_rule: match self.flags.await_rule {
+                AwaitRule::OutsideAsyncFunction => AwaitRule::OutsideFunction,
+                rule => rule,
+            },
+            ..self.flags
+        };
         self.emit_make_callable(body, "class body", |interns, namespace_size| {
             Self::compile_class_body(
                 &body.body,
@@ -1373,7 +1406,7 @@ impl<'a, 'i> Compiler<'a, 'i> {
                 generators,
                 captured_slots,
             } => {
-                self.compile_list_comp(elt, generators, captured_slots)?;
+                self.compile_list_comp(elt, generators, captured_slots, expr_loc.position)?;
             }
 
             Expr::SetComp {
@@ -1381,7 +1414,7 @@ impl<'a, 'i> Compiler<'a, 'i> {
                 generators,
                 captured_slots,
             } => {
-                self.compile_set_comp(elt, generators, captured_slots)?;
+                self.compile_set_comp(elt, generators, captured_slots, expr_loc.position)?;
             }
 
             Expr::DictComp {
@@ -1390,7 +1423,7 @@ impl<'a, 'i> Compiler<'a, 'i> {
                 generators,
                 captured_slots,
             } => {
-                self.compile_dict_comp(key, value, generators, captured_slots)?;
+                self.compile_dict_comp(key, value, generators, captured_slots, expr_loc.position)?;
             }
 
             Expr::Lambda { func_def } => {
@@ -1403,8 +1436,20 @@ impl<'a, 'i> Compiler<'a, 'i> {
             }
 
             Expr::Await(value) => {
-                if self.flags.forbid_await {
-                    return Err(CompileError::new("'await' outside function", expr_loc.position));
+                match self.flags.await_rule {
+                    AwaitRule::Allowed => {}
+                    AwaitRule::OutsideFunction => {
+                        return Err(CompileError::new("'await' outside function", expr_loc.position));
+                    }
+                    AwaitRule::OutsideAsyncFunction => {
+                        return Err(match self.comprehension_position {
+                            Some(position) => CompileError::new(
+                                "asynchronous comprehension outside of an asynchronous function",
+                                position,
+                            ),
+                            None => CompileError::new("'await' outside async function", expr_loc.position),
+                        });
+                    }
                 }
                 // Await expressions: compile the inner expression, then emit Await
                 // Await handles ExternalFuture, Coroutine, and GatherFuture
@@ -2934,6 +2979,7 @@ impl<'a, 'i> Compiler<'a, 'i> {
         elt: &ExprLoc,
         generators: &[Comprehension],
         captured_slots: &[u16],
+        position: CodeRange,
     ) -> Result<(), CompileError> {
         if self.code.is_dead() {
             return Ok(());
@@ -2946,7 +2992,7 @@ impl<'a, 'i> Compiler<'a, 'i> {
             .expect("list comp: BuildList kept us live, stack_depth must be Some");
         self.enter_captured_comp_cells(captured_slots, elt.position)?;
 
-        self.compile_comprehension_generators(generators, 0, |compiler| {
+        self.compile_comprehension_generators(generators, 0, position, |compiler| {
             compiler.compile_expr(elt)?;
             if compiler.code.is_dead() {
                 return Ok(());
@@ -2965,6 +3011,7 @@ impl<'a, 'i> Compiler<'a, 'i> {
         elt: &ExprLoc,
         generators: &[Comprehension],
         captured_slots: &[u16],
+        position: CodeRange,
     ) -> Result<(), CompileError> {
         if self.code.is_dead() {
             return Ok(());
@@ -2977,7 +3024,7 @@ impl<'a, 'i> Compiler<'a, 'i> {
             .expect("set comp: BuildSet kept us live, stack_depth must be Some");
         self.enter_captured_comp_cells(captured_slots, elt.position)?;
 
-        self.compile_comprehension_generators(generators, 0, |compiler| {
+        self.compile_comprehension_generators(generators, 0, position, |compiler| {
             compiler.compile_expr(elt)?;
             if compiler.code.is_dead() {
                 return Ok(());
@@ -2997,6 +3044,7 @@ impl<'a, 'i> Compiler<'a, 'i> {
         value: &ExprLoc,
         generators: &[Comprehension],
         captured_slots: &[u16],
+        position: CodeRange,
     ) -> Result<(), CompileError> {
         if self.code.is_dead() {
             return Ok(());
@@ -3009,7 +3057,7 @@ impl<'a, 'i> Compiler<'a, 'i> {
             .expect("dict comp: BuildDict kept us live, stack_depth must be Some");
         self.enter_captured_comp_cells(captured_slots, key.position)?;
 
-        self.compile_comprehension_generators(generators, 0, |compiler| {
+        self.compile_comprehension_generators(generators, 0, position, |compiler| {
             compiler.compile_expr(key)?;
             compiler.compile_expr(value)?;
             if compiler.code.is_dead() {
@@ -3100,10 +3148,14 @@ impl<'a, 'i> Compiler<'a, 'i> {
     /// 6. Per-iteration `POP` for each comp-var leaf produced by this
     ///    generator's target, restoring the loop-start stack shape.
     /// 7. Jump back to loop start.
+    ///
+    /// `position` is the position of the whole comprehension, for the error
+    /// about an `await` in its body.
     fn compile_comprehension_generators(
         &mut self,
         generators: &[Comprehension],
         index: usize,
+        position: CodeRange,
         body_fn: impl FnOnce(&mut Self) -> Result<(), CompileError>,
     ) -> Result<(), CompileError> {
         let generator = &generators[index];
@@ -3111,6 +3163,10 @@ impl<'a, 'i> Compiler<'a, 'i> {
         // Compile iterator expression
         self.compile_expr(&generator.iter)?;
         self.code.emit(Opcode::GetIter)?;
+
+        // The rest is in the comprehension's own scope (see `comprehension_position`).
+        let enclosing_comprehension = self.comprehension_position;
+        self.comprehension_position = Some(enclosing_comprehension.unwrap_or(position));
 
         // Loop start
         let loop_start = self.code.current_jump_target();
@@ -3135,7 +3191,7 @@ impl<'a, 'i> Compiler<'a, 'i> {
 
         // Recurse or emit body.
         if index + 1 < generators.len() {
-            self.compile_comprehension_generators(generators, index + 1, body_fn)?;
+            self.compile_comprehension_generators(generators, index + 1, position, body_fn)?;
         } else {
             body_fn(self)?;
         }
@@ -3159,6 +3215,7 @@ impl<'a, 'i> Compiler<'a, 'i> {
         for slot in &comp_var_slots {
             self.comp_slots[usize::from(*slot)] = None;
         }
+        self.comprehension_position = enclosing_comprehension;
 
         Ok(())
     }
