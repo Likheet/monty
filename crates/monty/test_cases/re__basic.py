@@ -222,6 +222,9 @@ assert re.findall('(?xm)(?-m:a # )\n$)', 'a\n') == ['a']
 m = re.search('(?x)a(?=(b # )\n|$))', 'a\n')
 assert m is not None
 assert m.group(1) == ''
+# a $ followed only by VERBOSE whitespace or a comment still ends the pattern or the lookahead
+assert re.findall(r'(?x)\w+$  # the last word', 'word ' * 50_000 + 'end\n') == ['end']
+assert re.findall(r'(?x)\w+ (?= , | $ )', 'word ' * 50_000 + 'end\n') == ['end']
 
 # === More DOTALL tests ===
 # Without DOTALL, . does not match newline

@@ -603,7 +603,7 @@ const CACHE_CAPACITY: usize = 256;
 /// `delegate_size_limit` for compiles retained in the cache, which is invisible to the
 /// resource tracker. `fancy_regex` applies it per delegated sub-regex, so it bounds a regex
 /// loosely. Patterns compiling bigger still work — recompiled per call at default limits,
-/// never retained — but an entry's lazily compiled forms may be retained slightly over it.
+/// never retained — and so do the forms of a cached pattern that `RePattern` compiles lazily.
 const CACHED_SIZE_LIMIT: usize = 64 * 1024;
 
 /// Longest *source* pattern retained — the text-side counterpart of

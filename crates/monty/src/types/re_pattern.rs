@@ -133,7 +133,7 @@ impl RePattern {
     /// As [`RePattern::compile`], but caps the compiled size of the delegated regexes
     /// (`RegexBuilder::delegate_size_limit`) so the `re` module's pattern cache can
     /// bound the memory its entries retain. The limit is retained and applied to the
-    /// regexes compiled lazily (see [`RePattern::compile_lazily`]) too, so a cached entry
+    /// regexes compiled lazily (see [`RePattern::get_or_compile`]) too, so a cached entry
     /// cannot pin large regexes via `.match()`/`.fullmatch()`.
     pub(crate) fn compile_bounded(
         pattern: String,
@@ -178,18 +178,13 @@ impl RePattern {
     /// pattern has a `$` outside MULTILINE, compiling them on first use, else `regexes`.
     ///
     /// Only then do Python's `$` and `fancy_regex`'s differ, and the newline regexes are slower.
-    fn for_subject(&self, text: &str) -> RunResult<&CompiledSet> {
+    fn for_subject(&self, text: &str) -> RunResult<Cow<'_, CompiledSet>> {
         match &self.newline_regexes {
-            Some(cell) if text.ends_with('\n') => {
-                if let Some(regexes) = cell.get() {
-                    return Ok(regexes);
-                }
-                let compiled = self.compile_lazily(&self.pattern, true)?;
-                // `set` only fails on a concurrent init, impossible on the single-threaded VM.
-                let _ = cell.set(CompiledSet::new(compiled, true));
-                Ok(cell.get().expect("cell was just initialised"))
-            }
-            _ => Ok(&self.regexes),
+            Some(cell) if text.ends_with('\n') => self.get_or_compile(cell, |limit| {
+                compile_regex_limited(&self.pattern, self.flags, limit, true)
+                    .map(|(regex, _)| CompiledSet::new(regex, true))
+            }),
+            _ => Ok(Cow::Borrowed(&self.regexes)),
         }
     }
 
@@ -197,35 +192,29 @@ impl RePattern {
     ///
     /// A final `$` that applies to the whole pattern goes after the group instead, so it stays a
     /// trailing lookahead, which `fancy_regex` runs on its linear engine (see [`TrailingDollar`]).
-    fn match_regex<'a>(&self, regexes: &'a CompiledSet) -> RunResult<&'a Regex> {
-        if let Some(regex) = regexes.compiled_match.get() {
-            return Ok(regex);
-        }
-        let source = match self.trailing_dollar {
-            TrailingDollar::WholePattern => format!("\\A(?:{})$", self.without_trailing_dollar()),
-            TrailingDollar::None | TrailingDollar::LastAlternative => format!("\\A(?:{})", self.pattern),
-        };
-        let compiled = self.compile_lazily(&source, regexes.dollar_before_newline)?;
-        // `set` only fails on a concurrent init, impossible on the single-threaded VM.
-        let _ = regexes.compiled_match.set(compiled);
-        Ok(regexes.compiled_match.get().expect("cell was just initialised"))
+    fn match_regex<'a>(&self, regexes: &'a CompiledSet) -> RunResult<Cow<'a, Regex>> {
+        self.get_or_compile(&regexes.compiled_match, |limit| {
+            let source = match self.trailing_dollar {
+                TrailingDollar::WholePattern => format!("\\A(?:{})$", self.without_trailing_dollar()),
+                TrailingDollar::None | TrailingDollar::LastAlternative => format!("\\A(?:{})", self.pattern),
+            };
+            compile_regex_limited(&source, self.flags, limit, regexes.dollar_before_newline).map(|(regex, _)| regex)
+        })
     }
 
     /// Returns the `\A(?:pattern)\z` regex of `regexes` for `fullmatch()`, compiling on first use.
     ///
     /// A final `$` outside every group is dropped: just before `\z` it always holds, and kept
     /// it would put the regex on `fancy_regex`'s backtracking VM.
-    fn fullmatch_regex<'a>(&self, regexes: &'a CompiledSet) -> RunResult<&'a Regex> {
-        if let Some(regex) = regexes.compiled_fullmatch.get() {
-            return Ok(regex);
-        }
-        let body = match self.trailing_dollar {
-            TrailingDollar::None => self.pattern.as_str(),
-            TrailingDollar::WholePattern | TrailingDollar::LastAlternative => self.without_trailing_dollar(),
-        };
-        let compiled = self.compile_lazily(&format!("\\A(?:{body})\\z"), regexes.dollar_before_newline)?;
-        let _ = regexes.compiled_fullmatch.set(compiled);
-        Ok(regexes.compiled_fullmatch.get().expect("cell was just initialised"))
+    fn fullmatch_regex<'a>(&self, regexes: &'a CompiledSet) -> RunResult<Cow<'a, Regex>> {
+        self.get_or_compile(&regexes.compiled_fullmatch, |limit| {
+            let body = match self.trailing_dollar {
+                TrailingDollar::None => self.pattern.as_str(),
+                TrailingDollar::WholePattern | TrailingDollar::LastAlternative => self.without_trailing_dollar(),
+            };
+            let source = format!("\\A(?:{body})\\z");
+            compile_regex_limited(&source, self.flags, limit, regexes.dollar_before_newline).map(|(regex, _)| regex)
+        })
     }
 
     /// The pattern without the final `$` that `trailing_dollar` records.
@@ -233,19 +222,31 @@ impl RePattern {
         &self.pattern[..self.pattern.len() - 1]
     }
 
-    /// Compiles `source`, the pattern or an anchored form of it, for a regex built on first use.
+    /// Returns the value in `cell`, building it with `compile` (given the limit to compile at) on
+    /// first use.
     ///
-    /// These forms can be a little bigger than the regex [`RePattern::compile_bounded`] checked,
-    /// so one over the cache's size cap is compiled at the default limit, not failed as invalid.
-    fn compile_lazily(&self, source: &str, dollar_before_newline: bool) -> RunResult<Regex> {
-        let compiled = match compile_regex_limited(source, self.flags, self.delegate_size_limit, dollar_before_newline)
-        {
-            Err(err) if self.delegate_size_limit.is_some() && is_size_limit_error(&err) => {
-                compile_regex_limited(source, self.flags, None, dollar_before_newline)
+    /// A value within the cache's size cap is kept in `cell`. One over it, which a form of the pattern
+    /// can be although the pattern fit, is compiled at the default limit and returned for this call only,
+    /// as the cache does with a pattern over its cap.
+    fn get_or_compile<'a, T: Clone>(
+        &self,
+        cell: &'a OnceCell<T>,
+        compile: impl Fn(Option<usize>) -> Result<T, RegexError>,
+    ) -> RunResult<Cow<'a, T>> {
+        if let Some(value) = cell.get() {
+            return Ok(Cow::Borrowed(value));
+        }
+        match compile(self.delegate_size_limit) {
+            Ok(value) => {
+                // `set` only fails on a concurrent init, impossible on the single-threaded VM.
+                let _ = cell.set(value);
+                Ok(Cow::Borrowed(cell.get().expect("cell was just initialised")))
             }
-            result => result,
-        };
-        compiled.map(|(regex, _)| regex).map_err(ExcType::re_pattern_error)
+            Err(err) if self.delegate_size_limit.is_some() && is_size_limit_error(&err) => {
+                compile(None).map(Cow::Owned).map_err(ExcType::re_pattern_error)
+            }
+            Err(err) => Err(ExcType::re_pattern_error(err)),
+        }
     }
 
     /// Builds a single `ReMatch` heap value from a capture result, keeping the
@@ -278,7 +279,8 @@ impl RePattern {
     ///
     /// Returns a `ReMatch` heap object on success, or `Value::None` if no match.
     pub fn match_start(&self, subject: &Value, text: &str, heap: &Heap) -> RunResult<Value> {
-        match self.match_regex(self.for_subject(text)?)?.captures(text) {
+        let regexes = self.for_subject(text)?;
+        match self.match_regex(&regexes)?.captures(text) {
             Ok(Some(caps)) => Ok(self.build_match(&caps, subject, text.is_ascii(), heap)),
             Ok(None) => Ok(Value::None),
             Err(err) => Err(ExcType::re_pattern_error(err)),
@@ -293,7 +295,8 @@ impl RePattern {
     ///
     /// Returns a `ReMatch` heap object on success, or `Value::None` if no match.
     pub fn fullmatch(&self, subject: &Value, text: &str, heap: &Heap) -> RunResult<Value> {
-        match self.fullmatch_regex(self.for_subject(text)?)?.captures(text) {
+        let regexes = self.for_subject(text)?;
+        match self.fullmatch_regex(&regexes)?.captures(text) {
             Ok(Some(caps)) => Ok(self.build_match(&caps, subject, text.is_ascii(), heap)),
             Ok(None) => Ok(Value::None),
             Err(err) => Err(ExcType::re_pattern_error(err)),
@@ -312,7 +315,8 @@ impl RePattern {
     /// values could not release them, since `dec_ref` needs `&mut Heap` while the
     /// match iterator borrows the compiled pattern out of it.
     pub fn findall(&self, text: &str, heap: &Heap) -> RunResult<Value> {
-        let compiled = &self.for_subject(text)?.compiled;
+        let regexes = self.for_subject(text)?;
+        let compiled = &regexes.compiled;
         let cap_count = compiled.captures_len();
 
         match cap_count {
@@ -368,7 +372,8 @@ impl RePattern {
         let rust_repl = translate_replacement(repl)?;
         let effective_count = if count == 0 { usize::MAX } else { count };
 
-        let compiled = &self.for_subject(text)?.compiled;
+        let regexes = self.for_subject(text)?;
+        let compiled = &regexes.compiled;
         let mut result = String::new();
         let mut last_end = 0;
 
@@ -393,7 +398,8 @@ impl RePattern {
     /// element; if it is negative, no splits occur at all (CPython's split loop
     /// runs zero times), returning the whole subject as a single element.
     pub fn split(&self, text: &str, maxsplit: i64, heap: &Heap) -> RunResult<Value> {
-        let compiled = &self.for_subject(text)?.compiled;
+        let regexes = self.for_subject(text)?;
+        let compiled = &regexes.compiled;
         let pieces = match maxsplit.cmp(&0) {
             Ordering::Less => vec![text],
             Ordering::Equal => collect_slices(compiled.split(text), heap)?,
@@ -417,7 +423,8 @@ impl RePattern {
         // Every match shares one refcounted subject reference, not a copy each.
         let all_ascii = text.is_ascii();
 
-        let compiled = &self.for_subject(text)?.compiled;
+        let regexes = self.for_subject(text)?;
+        let compiled = &regexes.compiled;
         let mut results = Vec::new();
         for caps in compiled.captures_iter(text) {
             check_results_growth(&results, heap)?;
@@ -885,15 +892,16 @@ fn translate_end_anchors(pattern: &str, multiline: bool, dollar_before_newline: 
             }
             '$' if !scope.multiline => {
                 anchors.has_dollar = true;
-                let next = chars.peek().copied();
-                // moved out of a `match()` wrapper, the `$` must still be outside MULTILINE
-                if next.is_none() && open.is_empty() && !multiline {
+                // `match()` and `fullmatch()` cut this `$` off the pattern's text, so it must be the last character,
+                // and moved out of the wrapper, it must still be outside MULTILINE
+                if chars.peek().is_none() && open.is_empty() && !multiline {
                     anchors.trailing_dollar = if top_level_alternation {
                         TrailingDollar::LastAlternative
                     } else {
                         TrailingDollar::WholePattern
                     };
                 }
+                let next = next_significant(&chars, scope.verbose);
                 let ends_lookahead_alternative =
                     matches!(next, Some('|' | ')')) && open.last().is_some_and(|&(_, lookahead)| lookahead);
                 out.push_str(match (dollar_before_newline, next) {
@@ -916,6 +924,21 @@ struct Scope {
     multiline: bool,
     /// VERBOSE, under which `#` starts a comment that runs to the end of the line.
     verbose: bool,
+}
+
+/// The next character of the pattern that counts, past whitespace and `#` comments when `verbose`.
+///
+/// Whitespace is the set CPython's `re` skips, not Unicode's.
+fn next_significant(chars: &iter::Peekable<str::Chars<'_>>, verbose: bool) -> Option<char> {
+    let mut ahead = chars.clone();
+    loop {
+        match ahead.next()? {
+            ' ' | '\t' | '\n' | '\r' | '\x0b' | '\x0c' if verbose => {}
+            // a comment runs to the end of the line
+            '#' if verbose => _ = ahead.find(|&c| c == '\n')?,
+            c => return Some(c),
+        }
+    }
 }
 
 /// Copies a character class through its closing `]`, just past the opening `[`.

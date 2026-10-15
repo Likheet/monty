@@ -95,7 +95,8 @@ representation does not carry them.
     it has taken 1,000,000 backtracking steps, where CPython continues.
     The steps add up over every start position the search tries, so a pattern can work on a short subject and raise on a
     long one whose next match is far from where the search starts.
-    The VM's backtracking stack is not tracked by the resource limits.
+    The VM's backtracking stack counts toward `max_memory`, but no checkpoint runs during a search, so only the hard
+    ceiling applies to it: see [resource_limits.md](resource_limits.md).
 - For a subject ending in `\n`, a `$` outside MULTILINE also puts the pattern on that VM, unless the `$` ends the
     pattern or ends an alternative of a lookahead that ends the pattern.
     So `re.findall(r'\w+(?:,|$)', text)` can raise on a long `text` ending in `\n`, where `r'\w+(?=,|$)'` does not.
