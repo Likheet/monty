@@ -531,6 +531,9 @@ impl<'h> PyTrait<'h> for PyValue<'h> {
     fn py_call_attr(&mut self, vm: &mut VM<'h>, attr: &EitherStr, args: ArgValues) -> RunResult<CallResult> {
         forward_py_value!(self, |value| value.py_call_attr(vm, attr, args), {
             Self::Module(value) => value.py_call_attr(vm, attr, args),
+            Self::Builtin(Builtins::ExcType(exc_type)) if let EitherStr::Interned(id) = attr => {
+                Type::Exception(*exc_type).call_class_method(*id, args, vm)
+            }
             Self::Builtin(Builtins::Type(ty)) if let EitherStr::Interned(id) = attr => ty.call_class_method(*id, args, vm),
             _ => {
                 args.drop_with(vm);
