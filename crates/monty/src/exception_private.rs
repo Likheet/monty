@@ -306,6 +306,7 @@ pub(crate) trait ExcTypeExt: Sized {
             .into()
         } else {
             // CPython: "insert expected 2 arguments, got 1"
+            let name = bare_function_name(name);
             SimpleException::new_msg(
                 ExcType::TypeError,
                 format!("{name} expected {expected} arguments, got {actual}"),
@@ -342,6 +343,7 @@ pub(crate) trait ExcTypeExt: Sized {
     #[must_use]
     fn type_error_at_least(name: &str, min: usize, actual: usize) -> RunError {
         // CPython: "get expected at least 1 argument, got 0"
+        let name = bare_function_name(name);
         let plural = if min == 1 { "" } else { "s" };
         SimpleException::new_msg(
             ExcType::TypeError,
@@ -362,6 +364,7 @@ pub(crate) trait ExcTypeExt: Sized {
     /// * `actual` - Number of arguments actually provided
     #[must_use]
     fn type_error_at_most(name: &str, max: usize, actual: usize) -> RunError {
+        let name = bare_function_name(name);
         let plural = if max == 1 { "" } else { "s" };
         SimpleException::new_msg(
             ExcType::TypeError,
@@ -3042,6 +3045,15 @@ impl RunError {
 }
 
 /// CPython's `ModuleNotFoundError` message for `module_name`.
+/// The name CPython's positional-count errors use, which never carries the type
+/// or module: `[1].pop(0, 1)` raises `pop expected at most 1 argument, got 2`.
+///
+/// Callers pass the qualified name (`list.pop`) that the other messages need,
+/// such as `list.pop() takes no keyword arguments`.
+fn bare_function_name(name: &str) -> &str {
+    name.rsplit_once('.').map_or(name, |(_, function)| function)
+}
+
 fn no_module_named(module_name: &str) -> String {
     format!("No module named '{module_name}'")
 }
