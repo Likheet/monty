@@ -884,21 +884,21 @@ fn insert<'h>(deque: &HeapReadMut<'h, Deque>, args: ArgValues, vm: &mut VM<'h>) 
     let mut item_guard = DropGuard::new(item, vm);
     let vm = item_guard.ctx();
 
-    // CPython checks fullness before touching the index.
+    // A big int is a valid insert position; one out of `i64` range is an
+    // `OverflowError` (CPython's `PyNumber_AsSsize_t`), not a type error.
+    // CPython's argument clinic converts the index before the fullness check.
+    let raw = match read_ssize(index_value, vm, ExcType::overflow_c_ssize_t) {
+        Some(Ok(i)) => i,
+        Some(Err(e)) => return Err(e),
+        None => return Err(ExcType::type_error_not_an_integer(&index_value.py_type_name(vm))),
+    };
+
     let this = deque.get(vm.heap);
     if let Some(max) = this.maxlen()
         && this.len() >= max
     {
         return Err(ExcType::index_error_deque_full());
     }
-
-    // A big int is a valid insert position; one out of `i64` range is an
-    // `OverflowError` (CPython's `PyNumber_AsSsize_t`), not a type error.
-    let raw = match read_ssize(index_value, vm, ExcType::overflow_c_ssize_t) {
-        Some(Ok(i)) => i,
-        Some(Err(e)) => return Err(e),
-        None => return Err(ExcType::type_error_not_an_integer(&index_value.py_type_name(vm))),
-    };
 
     // insert() clamps rather than raising, like list.insert.
     let len = i64::try_from(deque.get(vm.heap).len()).expect("len fits in i64");

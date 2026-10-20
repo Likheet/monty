@@ -365,6 +365,18 @@ try:
 except IndexError as exc:
     assert str(exc) == 'deque already at its maximum size', str(exc)
 
+# The index is converted first, so a bad index wins over a full deque, as in CPython.
+try:
+    deque([1], maxlen=1).insert('z', 99)
+    assert False, 'expected a str index to fail'
+except TypeError as exc:
+    assert str(exc) == "'str' object cannot be interpreted as an integer"
+try:
+    deque([1], maxlen=1).insert(2**70, 99)
+    assert False, 'expected a huge index to fail'
+except OverflowError as exc:
+    assert str(exc) == 'Python int too large to convert to C ssize_t'
+
 try:
     d = deque([1])
     d.maxlen = 3
