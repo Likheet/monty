@@ -433,6 +433,7 @@ impl GraphExporter {
             HeapReadOutput::DictValueIterator(_) => MontyNode::Repr("<dict_valueiterator object>".to_owned()),
             HeapReadOutput::SetIterator(_) => MontyNode::Repr("<set_iterator object>".to_owned()),
             HeapReadOutput::CallableIterator(_) => MontyNode::Repr("<callable_iterator object>".to_owned()),
+            HeapReadOutput::DirScan(scan) => MontyNode::Repr(scan.get(vm.heap).boundary_repr()),
             // A placeholder despite the real in-sandbox repr (`count(0)`),
             // which would recurse into `repeat`'s arbitrary object.
             HeapReadOutput::Itertools(iter) => {
@@ -767,7 +768,15 @@ impl MontyTypeExt for MontyType {
             | Type::HashlibHashXof
             | Type::Blake2b
             | Type::Blake2s
-            | Type::MissingType => return None,
+            | Type::MissingType
+            | Type::DirEntry
+            | Type::ScandirIterator
+            | Type::WalkGenerator
+            | Type::CsvReader
+            | Type::CsvWriter
+            | Type::CsvDictReader
+            | Type::CsvDictWriter
+            | Type::CsvDialect => return None,
             Type::Tuple => Self::Tuple,
             Type::NamedTuple => Self::NamedTuple,
             Type::Dict => Self::Dict,
@@ -1091,7 +1100,7 @@ fn intern_host_class_type(
     match vm.heap.resolve_host_type(&type_id) {
         Some(class_id) => {
             vm.heap.inc_ref(class_id);
-            let HeapReadOutput::HostClassType(mut ty) = vm.heap.read(class_id) else {
+            let HeapReadOutput::HostClassType(ty) = vm.heap.read(class_id) else {
                 unreachable!("host_type_index points at a non-host-class-type entry");
             };
             let replaced = (!attrs.is_empty()).then_some(attrs);
