@@ -16,6 +16,7 @@ mod os_policy;
 mod resource;
 mod results;
 mod run_options;
+pub mod scan;
 mod type_checking;
 mod uuid;
 mod virtual_path;
@@ -47,12 +48,13 @@ pub use crate::{
         UnknownTimeZone, ZoneConstants, local_wall_clock, unix_seconds,
     },
     resource::{
-        BASELINE_MEMORY, DEFAULT_MAX_RECURSION_DEPTH, DEFAULT_MAX_SUSPENSIONS, LARGE_RESULT_THRESHOLD, LIVE_MEMORY,
-        OOM_EXIT_CODE, ResourceError, ResourceLimits, ResourceTracker, TimeLimitScope, allocate_into_baseline,
-        memory_limit_with_headroom,
+        BASELINE_MEMORY, DEFAULT_GC_INTERVAL, DEFAULT_MAX_RECURSION_DEPTH, DEFAULT_MAX_SUSPENSIONS,
+        LARGE_RESULT_THRESHOLD, LIVE_MEMORY, OOM_EXIT_CODE, ResourceError, ResourceLimits, ResourceTracker,
+        TimeLimitScope, allocate_into_baseline, memory_limit_with_headroom,
     },
     results::{ExtFunctionResult, NameLookupResult},
     run_options::{AssertMessageAnnotations, CompileOptions, SOURCE_SCAN_THRESHOLD},
+    scan::ScanArgs,
     type_checking::{
         CHECKER_MODULE_NAMES, ModuleStub, ModuleStubError, SANDBOX_MODULE_NAMES, TypeCheckState, TypeCheckingConfig,
         TypeCheckingFormat, is_identifier, validate_module_name,

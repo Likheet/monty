@@ -2115,6 +2115,81 @@ async fn loaded_session_keeps_its_duration_budget() {
     restored.finish().await.unwrap();
 }
 
+/// A real subprocess cannot import a larger snapshot budget into a stricter checkout.
+#[tokio::test]
+async fn restored_session_cannot_raise_the_destination_memory_budget() {
+    let pool = Pool::new(config()).await.unwrap();
+    let destination = ReplConfig {
+        limits: Some(ResourceLimits::default().max_memory(10 * 1024 * 1024)),
+        ..ReplConfig::default()
+    };
+    let allocation = "large = b'a' * (12 * 1024 * 1024)\nlen(large)";
+    let mut fresh = pool.checkout(&destination).await.unwrap();
+    assert_eq!(
+        expect_complete(fresh.feed("6 * 7", vec![], vec![], false, &mut no_print).await.unwrap()),
+        MontyObject::int(42)
+    );
+    let error = fresh
+        .feed(allocation, vec![], vec![], false, &mut no_print)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, PoolError::Runtime(ref exc) if exc.exc_type() == ExcType::MemoryError));
+    drop(fresh);
+    for suspended in [false, true] {
+        let mut source = pool
+            .checkout(&ReplConfig {
+                limits: Some(ResourceLimits::default().max_memory(64 * 1024 * 1024)),
+                ..ReplConfig::default()
+            })
+            .await
+            .unwrap();
+        source
+            .feed(
+                if suspended { "x = 42\nfetch('x')" } else { "x = 42" },
+                vec![],
+                vec![],
+                false,
+                &mut no_print,
+            )
+            .await
+            .unwrap();
+        let state = source.dump().await.unwrap();
+        drop(source);
+        let mut restored = pool.checkout(&destination).await.unwrap();
+        let (event, _) = restored.restore(state, vec![], &mut no_print).await.unwrap();
+        if suspended {
+            assert!(matches!(event, Some(TurnEvent::FunctionCall { .. })));
+            restored
+                .resume(ResumeValue::Return(MontyObject::none()), &mut no_print)
+                .await
+                .unwrap();
+        } else {
+            assert!(event.is_none());
+        }
+        assert_eq!(
+            expect_complete(restored.feed("x", vec![], vec![], false, &mut no_print).await.unwrap()),
+            MontyObject::int(42)
+        );
+        let error = restored
+            .feed(allocation, vec![], vec![], false, &mut no_print)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, PoolError::Runtime(ref exc) if exc.exc_type() == ExcType::MemoryError));
+        drop(restored);
+    }
+    let mut sibling = pool.checkout(&destination).await.unwrap();
+    assert_eq!(
+        expect_complete(
+            sibling
+                .feed("6 * 7", vec![], vec![], false, &mut no_print)
+                .await
+                .unwrap()
+        ),
+        MontyObject::int(42)
+    );
+    sibling.finish().await.unwrap();
+}
+
 // =============================================================================
 // Lifecycle
 // =============================================================================
@@ -2810,6 +2885,54 @@ async fn a_raw_feed_restarts_the_parent_feed_clock() {
         .expect_err("the stand-in never answers the second feed");
     let PoolError::Timeout { timeout } = err else {
         panic!("expected the feed backstop to fire, got {err:?}");
+    };
+    assert_eq!(timeout, budget + grace);
+}
+
+/// A `Load` reply claiming a looser feed budget than the checkout's cannot
+/// loosen the parent's feed backstop: the configured budget stays the ceiling.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_load_reply_cannot_loosen_the_feed_backstop() {
+    let dir = tempfile::tempdir().unwrap();
+    let budget = Duration::from_millis(300);
+    let grace = Duration::from_millis(100);
+    // `Ok` answers Configure, then the Load, claiming an hour's feed budget.
+    // The feed after it goes unanswered.
+    let mut replies = framed(&child_event(pb::child_event::Kind::Ok(pb::Ok {})));
+    replies.extend(framed(&pb::ChildEvent {
+        max_feed_duration_micros: Some(3_600_000_000),
+        ..child_event(pb::child_event::Kind::Ok(pb::Ok {}))
+    }));
+    let replies_path = dir.path().join("replies.bin");
+    fs::write(&replies_path, &replies).unwrap();
+    let fake = write_fake_monty(
+        dir.path(),
+        &format!("#!/bin/sh\ncat '{}'\nsleep 30\n", replies_path.display()),
+    );
+
+    let mut config = PoolConfig::subprocess(&fake);
+    config.feed_duration_limit_grace = Some(grace);
+    config.request_timeout = None;
+    let pool = Pool::new(config).await.unwrap();
+    let mut checkout = pool
+        .checkout(&ReplConfig {
+            limits: Some(ResourceLimits::default().max_feed_duration(budget)),
+            ..ReplConfig::default()
+        })
+        .await
+        .expect("the stand-in answers Configure with Ok");
+    let (event, _) = checkout.restore(vec![0], vec![], &mut no_print).await.unwrap();
+    assert!(event.is_none());
+
+    // Bounded so a regression fails here rather than waiting out the stand-in.
+    let outcome = timeout(
+        Duration::from_secs(5),
+        checkout.feed("x", vec![], vec![], false, &mut no_print),
+    )
+    .await;
+    let Ok(Err(PoolError::Timeout { timeout })) = outcome else {
+        panic!("the configured feed budget must backstop the restored feed, got {outcome:?}");
     };
     assert_eq!(timeout, budget + grace);
 }

@@ -496,7 +496,7 @@ impl MontyRepl {
                                     vm.run_external()
                                 }
                                 Ok(exit) => {
-                                    let error = vm.unsupported_frame_exit("MontyRepl::call_function", exit);
+                                    let error = vm.unsupported_frame_exit(exit);
                                     vm.resume_with_exception(error)
                                 }
                                 Err(error) => {
@@ -734,6 +734,17 @@ impl ReplProgress {
             Self::ResolveFutures(state) => state.repl.tracker(),
             Self::NameLookup(lookup) => lookup.snapshot.repl.tracker(),
             Self::Complete { repl, .. } => repl.tracker(),
+        }
+    }
+
+    /// Returns the mutable tracker so hosts can tighten restored limits before resuming execution.
+    pub fn tracker_mut(&mut self) -> &mut ResourceTracker {
+        match self {
+            Self::FunctionCall(call) => call.snapshot.repl.tracker_mut(),
+            Self::OsCall(call) => call.snapshot.repl.tracker_mut(),
+            Self::ResolveFutures(state) => state.repl.tracker_mut(),
+            Self::NameLookup(lookup) => lookup.snapshot.repl.tracker_mut(),
+            Self::Complete { repl, .. } => repl.tracker_mut(),
         }
     }
 }
