@@ -195,8 +195,8 @@ impl RePattern {
     fn match_regex<'a>(&self, regexes: &'a CompiledSet) -> RunResult<Cow<'a, Regex>> {
         self.get_or_compile(&regexes.compiled_match, |limit| {
             let source = match self.trailing_dollar {
-                TrailingDollar::WholePattern => format!("\\A(?:{})$", self.without_trailing_dollar()),
-                TrailingDollar::None | TrailingDollar::LastAlternative => format!("\\A(?:{})", self.pattern),
+                TrailingDollar::WholePattern => anchored_source(self.without_trailing_dollar(), "$"),
+                TrailingDollar::None | TrailingDollar::LastAlternative => anchored_source(&self.pattern, ""),
             };
             compile_regex_limited(&source, self.flags, limit, regexes.dollar_before_newline).map(|(regex, _)| regex)
         })
@@ -212,7 +212,7 @@ impl RePattern {
                 TrailingDollar::None => self.pattern.as_str(),
                 TrailingDollar::WholePattern | TrailingDollar::LastAlternative => self.without_trailing_dollar(),
             };
-            let source = format!("\\A(?:{body})\\z");
+            let source = anchored_source(body, "\\z");
             compile_regex_limited(&source, self.flags, limit, regexes.dollar_before_newline).map(|(regex, _)| regex)
         })
     }
@@ -393,13 +393,17 @@ impl RePattern {
 
     /// `pattern.split(string, maxsplit=0)` — split string by pattern occurrences.
     ///
-    /// Returns a list of strings. If `maxsplit` is positive, at most `maxsplit`
+    /// Returns a list of strings, with each capture group's text (or `None`) after
+    /// the piece before its match. If `maxsplit` is positive, at most `maxsplit`
     /// splits occur and the remainder of the string is returned as the final
     /// element; if it is negative, no splits occur at all (CPython's split loop
     /// runs zero times), returning the whole subject as a single element.
     pub fn split(&self, text: &str, maxsplit: i64, heap: &Heap) -> RunResult<Value> {
         let regexes = self.for_subject(text)?;
         let compiled = &regexes.compiled;
+        if compiled.captures_len() > 1 {
+            return Self::split_with_groups(compiled, text, maxsplit, heap);
+        }
         let pieces = match maxsplit.cmp(&0) {
             Ordering::Less => vec![text],
             Ordering::Equal => collect_slices(compiled.split(text), heap)?,
@@ -412,6 +416,33 @@ impl RePattern {
         };
 
         allocate_str_list(&pieces, heap)
+    }
+
+    /// [`RePattern::split`] for a pattern with capture groups, whose text CPython puts after
+    /// the piece before each match: one entry per group, `None` for a group that didn't take part.
+    /// `compiled` is the regex that [`RePattern::for_subject`] chose for `text`.
+    fn split_with_groups(compiled: &Regex, text: &str, maxsplit: i64, heap: &Heap) -> RunResult<Value> {
+        let limit = match maxsplit.cmp(&0) {
+            Ordering::Less => 0,
+            Ordering::Equal => usize::MAX,
+            Ordering::Greater => usize::try_from(maxsplit).unwrap_or(usize::MAX),
+        };
+        let mut pieces: Vec<Option<&str>> = Vec::new();
+        let mut last_end = 0;
+        for caps in compiled.captures_iter(text).take(limit) {
+            let caps = caps.map_err(ExcType::re_pattern_error)?;
+            let m = caps.get(0).expect("capture group 0 always exists");
+            check_slice_growth(&pieces, heap)?;
+            pieces.push(Some(&text[last_end..m.start()]));
+            for group in caps.iter().skip(1) {
+                check_slice_growth(&pieces, heap)?;
+                pieces.push(group.map(|g| g.as_str()));
+            }
+            last_end = m.end();
+        }
+        check_slice_growth(&pieces, heap)?;
+        pieces.push(Some(&text[last_end..]));
+        allocate_optional_str_list(&pieces, heap)
     }
 
     /// `pattern.finditer(string)` — return all matches as a list.
@@ -448,11 +479,16 @@ fn check_results_growth(results: &Vec<Value>, heap: &Heap) -> RunResult<()> {
         .check_growth(results.len(), results.capacity(), VALUE_SIZE)?)
 }
 
-/// [`check_results_growth`] for a buffer of borrowed match slices.
-fn check_slice_growth(slices: &Vec<&str>, heap: &Heap) -> RunResult<()> {
+/// [`check_results_growth`] for a buffer of borrowed match slices (`&str`, or
+/// `Option<&str>` where a split's group may be missing).
+///
+/// Also polls the time limit, amortized with `check_time_every`: no instruction
+/// checkpoint can stop the scan that fills the buffer either.
+fn check_slice_growth<T>(slices: &Vec<T>, heap: &Heap) -> RunResult<()> {
+    heap.tracker.check_time_every(slices.len())?;
     Ok(heap
         .tracker
-        .check_growth(slices.len(), slices.capacity(), mem::size_of::<&str>())?)
+        .check_growth(slices.len(), slices.capacity(), mem::size_of::<T>())?)
 }
 
 /// Collects the pieces an iterator yields, preflighting the buffer as it grows.
@@ -478,6 +514,16 @@ fn collect_slices<'t>(
 fn allocate_str_list(slices: &[&str], heap: &Heap) -> RunResult<Value> {
     heap.tracker.check_allocation(slices.len().saturating_mul(VALUE_SIZE))?;
     let results = slices.iter().map(|s| allocate_string(*s, heap)).collect();
+    Ok(Value::Ref(heap.allocate(HeapData::List(List::new(results)))))
+}
+
+/// [`allocate_str_list`] for a split with capture groups, where a missing group becomes `None`.
+fn allocate_optional_str_list(pieces: &[Option<&str>], heap: &Heap) -> RunResult<Value> {
+    heap.tracker.check_allocation(pieces.len().saturating_mul(VALUE_SIZE))?;
+    let results = pieces
+        .iter()
+        .map(|piece| piece.map_or(Value::None, |s| allocate_string(s, heap)))
+        .collect();
     Ok(Value::Ref(heap.allocate(HeapData::List(List::new(results)))))
 }
 
@@ -725,6 +771,16 @@ pub(crate) fn extract_count(val: Option<Value>, vm: &mut VM<'_>) -> RunResult<Op
             )))
         }
     }
+}
+
+/// Returns `\A(?:pattern)` followed by `suffix`: the anchored source for `match()` and `fullmatch()`.
+///
+/// A `(?x)` pattern can end in a `#` comment, which runs to the next line break and would hide the closing `)`.
+/// So the group closes on a new line.
+/// If VERBOSE is off at the end of the pattern, the `(?x)` before the line break makes it whitespace, not a literal.
+/// The group's `)` ends that flag, so it does not apply to `suffix`.
+fn anchored_source(pattern: &str, suffix: &str) -> String {
+    format!("\\A(?:{pattern}(?x)\n){suffix}")
 }
 
 /// Compiles a Python regex pattern string with flags into a Rust `Regex`.
