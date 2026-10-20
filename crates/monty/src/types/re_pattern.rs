@@ -573,18 +573,15 @@ fn call_pattern_sub<'h>(pattern: &HeapRead<'h, RePattern>, args: ArgValues, vm: 
 
     let count = extract_count(count_val, vm)?;
 
-    // Check that repl is a string — callable replacement is not supported.
-    // CPython processes the replacement template *before* its match loop, so
-    // this check must precede the negative-count early return below: a bad
-    // repl raises even when zero substitutions will run.
-    let Ok(repl) = repl_val.to_str(vm) else {
-        return Err(ExcType::type_error(
-            "callable replacement is not yet supported in re.sub()",
-        ));
-    };
+    // CPython processes the replacement *before* its match loop, so this check
+    // must precede the negative-count early return below: a bad repl raises
+    // even when zero substitutions will run.
+    let template = sub_template(repl_val, vm)?;
     let Some(count) = count else {
-        // Validate octal escapes even when the negative count skips matching.
-        translate_replacement(repl)?;
+        if let Some(template) = template {
+            // Validate octal escapes even when the negative count skips matching.
+            translate_replacement(template)?;
+        }
         // Negative count — Pattern.sub returns the input string unchanged.
         // The subject is still type-checked (`to_str` raises this method's
         // `expected string, not {t}` wording) before the refcount bump; no
@@ -594,7 +591,100 @@ fn call_pattern_sub<'h>(pattern: &HeapRead<'h, RePattern>, args: ArgValues, vm: 
     };
 
     let text = string_val.to_str(vm)?;
-    pattern.get(vm.heap).sub(repl, text, count, vm.heap)
+    if let Some(template) = template {
+        pattern.get(vm.heap).sub(template, text, count, vm.heap)
+    } else {
+        let matches = pattern.get(vm.heap).finditer(string_val, text, vm.heap)?;
+        sub_with_function(matches, repl_val, string_val, count, vm)
+    }
+}
+
+/// A `sub()` replacement: `Some(template)` for a `str`, `None` for a function
+/// to call with each match, and CPython's error for anything else.
+pub(crate) fn sub_template<'a>(repl: &'a Value, vm: &'a VM<'_>) -> RunResult<Option<&'a str>> {
+    if let Ok(template) = repl.to_str(vm) {
+        Ok(Some(template))
+    } else if repl.is_callable(vm) {
+        Ok(None)
+    } else {
+        Err(ExcType::type_error(format!(
+            "decoding to str: need a bytes-like object, {} found",
+            repl.py_type_name(vm)
+        )))
+    }
+}
+
+/// `sub()` with a function as `repl`: each of the first `count` matches (all
+/// of them when `count` is 0) is replaced by `repl(match)`, in order.
+///
+/// `matches` is the list that [`RePattern::finditer`] built, made up front
+/// because a call needs the whole VM while the pattern borrows the heap. As in
+/// CPython's `pattern_subx`, a `None` result adds nothing, and a result that is
+/// not a `str` fails only after every call has run, when the pieces are joined.
+pub(crate) fn sub_with_function(
+    matches: Value,
+    repl: &Value,
+    subject: &Value,
+    count: usize,
+    vm: &mut VM<'_>,
+) -> RunResult<Value> {
+    defer_drop!(matches, vm);
+    let match_at = |index: usize, vm: &VM<'_>| match matches {
+        Value::Ref(id) => match vm.heap.get(*id) {
+            HeapData::List(list) => list.as_slice().get(index).map(|m| m.clone_with_heap(vm)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let text_len = subject.to_str(vm)?.len();
+    let limit = if count == 0 { usize::MAX } else { count };
+
+    let mut result = String::new();
+    let mut last_end = 0;
+    // CPython joins a list made of each non-empty run of text before a match and
+    // each result that is not `None`; its error names the first bad item.
+    let mut item = 0;
+    let mut first_bad: Option<(usize, String)> = None;
+    for index in 0..limit {
+        let Some(m) = match_at(index, vm) else {
+            break;
+        };
+        let (start, end) = match &m {
+            Value::Ref(id) => match vm.heap.get(*id) {
+                HeapData::ReMatch(m) => m.byte_span(),
+                _ => unreachable!("finditer builds a list of matches"),
+            },
+            _ => unreachable!("finditer builds a list of matches"),
+        };
+        if start > last_end {
+            result.push_str(&subject.to_str(vm)?[last_end..start]);
+            item += 1;
+        }
+        let replacement = vm.evaluate_function(repl, ArgValues::One(m))?;
+        defer_drop!(replacement, vm);
+        if !matches!(replacement, Value::None) {
+            match replacement.to_str(vm) {
+                Ok(text) => result.push_str(text),
+                Err(_) => {
+                    if first_bad.is_none() {
+                        first_bad = Some((item, replacement.py_type_name(vm).into_owned()));
+                    }
+                }
+            }
+            item += 1;
+        }
+        last_end = end;
+        // Check running size: current result + remaining unprocessed text.
+        check_estimated_size(result.len() + (text_len - last_end), &vm.heap.tracker)?;
+    }
+
+    if let Some((item, type_name)) = first_bad {
+        return Err(ExcType::type_error(format!(
+            "sequence item {item}: expected str instance, {type_name} found"
+        )));
+    }
+    result.push_str(&subject.to_str(vm)?[last_end..]);
+    Ok(allocate_string(result, vm.heap))
 }
 
 /// Handles `pattern.split(string, maxsplit=0)` argument extraction and dispatch.
