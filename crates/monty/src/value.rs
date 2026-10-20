@@ -1607,20 +1607,31 @@ impl Value {
             Ok(result)
         } else {
             let lhs_type = self.py_type(vm);
-            let lhs_name = self.py_type_name(vm);
             if operator == "*" && lhs_type.has_sequence_repeat() {
-                Err(ExcType::type_error_sequence_repeat(other.py_type_name(vm)))
+                self.repeat_by_index(other, vm)
             } else if operator == "*" && other.py_type(vm).has_sequence_repeat() {
-                Err(ExcType::type_error_sequence_repeat(lhs_name))
+                other.repeat_by_index(self, vm)
             } else {
                 Err(ExcType::binary_type_error(
                     operator,
                     lhs_type,
-                    lhs_name,
+                    self.py_type_name(vm),
                     other.py_type_name(vm),
                 ))
             }
         }
+    }
+
+    /// CPython's `sequence_repeat` fallback for `*`: repeats this sequence by the
+    /// count's `__index__` (`[0] * obj`), or names the count's type in the `TypeError`.
+    fn repeat_by_index(&self, count: &Self, vm: &mut VM<'_>) -> RunResult<Self> {
+        if let Some(index) = count.py_index_impl(vm)? {
+            defer_drop!(index, vm);
+            if let Some(result) = self.py_mul_impl(index, vm)? {
+                return Ok(result);
+            }
+        }
+        Err(ExcType::type_error_sequence_repeat(count.py_type_name(vm)))
     }
 
     /// Tries numeric slots, suppressing reflected dispatch between instances of the same class.

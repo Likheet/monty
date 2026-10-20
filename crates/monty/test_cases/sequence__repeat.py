@@ -65,3 +65,35 @@ for sequence, _ in sequences:
 for value, name in [(range(2), 'range'), ({}, 'dict'), (BadCount(), 'BadCount')]:
     assert multiply_error(value, 1.5) == f"unsupported operand type(s) for *: '{name}' and 'float'"
     assert multiply_error(1.5, value) == f"unsupported operand type(s) for *: 'float' and '{name}'"
+
+
+# === A count with `__index__` repeats the sequence in either operand order ===
+class Count:
+    def __init__(self, n):
+        self.n = n
+
+    def __index__(self):
+        return self.n
+
+
+for sequence, _ in sequences:
+    assert sequence * Count(2) == sequence * 2
+    assert Count(2) * sequence == sequence * 2
+    assert sequence * Count(-1) == sequence * 0
+    repeated = sequence * 1
+    repeated *= Count(3)
+    assert repeated == sequence * 3
+
+
+class RaisingCount:
+    def __index__(self):
+        raise ValueError('no count')
+
+
+try:
+    [1] * RaisingCount()
+    assert False, 'expected ValueError'
+except ValueError as exc:
+    assert str(exc) == 'no count'
+assert multiply_error('ab', Count('2')) == '__index__ returned non-int (type str)'
+assert multiply_error(Count(None), (1,)) == '__index__ returned non-int (type NoneType)'
