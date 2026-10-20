@@ -702,6 +702,28 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, List> {
         Ok(true)
     }
 
+    /// `list *= n` — repeats the list in place, as CPython's `list_inplace_repeat`
+    /// does, so an alias sees the result. A count that is not an `int` falls back
+    /// to binary `*`.
+    fn py_imul_impl(&mut self, other: &Value, vm: &mut VM<'h>) -> RunResult<bool> {
+        let Some(count) = repeat_count(other, vm)? else {
+            return Ok(false);
+        };
+        if count == 0 {
+            mem::take(&mut self.get_mut(vm.heap).items).drop_with(vm);
+        } else if count > 1 {
+            let value = self.get(vm.heap);
+            check_repeat_size(value.len().saturating_mul(VALUE_SIZE), count, &vm.heap.tracker)?;
+            let mut repeated = Vec::with_capacity(value.len() * (count - 1));
+            for rep in 1..count {
+                repeated.extend(value.as_slice().iter().map(|value| value.clone_with_heap(vm.heap)));
+                vm.heap.tracker.check_time_every(rep)?;
+            }
+            self.get_mut(vm.heap).items.extend(repeated);
+        }
+        Ok(true)
+    }
+
     /// Delegates methods to `call_list_method`.
     fn py_call_attr(&mut self, vm: &mut VM<'h>, attr: &EitherStr, args: ArgValues) -> RunResult<CallResult> {
         if attr.static_string(vm.interns) == Some(StaticStrings::Sort) {

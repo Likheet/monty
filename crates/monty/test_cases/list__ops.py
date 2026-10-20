@@ -85,6 +85,23 @@ lst = [1]
 lst *= 0
 assert lst == []
 
+# `*=` repeats the list in place, so an alias sees the change
+lst = [1, 2]
+alias = lst
+alias *= 2
+assert lst == [1, 2, 1, 2]
+assert alias is lst
+alias *= 1
+assert lst == [1, 2, 1, 2]
+assert alias is lst
+alias *= -1
+assert lst == []
+assert alias is lst
+nested = [[0]]
+nested *= 3
+assert nested == [[0], [0], [0]]
+assert nested[0] is nested[2]
+
 # === list() constructor ===
 assert list() == []
 assert list([1, 2, 3]) == [1, 2, 3]
