@@ -115,6 +115,98 @@ try:
 except TypeError as e:
     assert str(e) == "unsupported operand type(s) for -: 'set' and 'list'"
 
+# === In-place operators change the set itself ===
+s = {1, 2, 3}
+alias = s
+s &= {2, 3, 4}
+assert alias == {2, 3}
+s |= frozenset({5})
+assert alias == {2, 3, 5}
+s -= {2}
+assert alias == {3, 5}
+s ^= {5, 6}
+assert alias == {3, 6}
+assert s is alias
+
+# Only a `set` or `frozenset` updates in place: a `dict` view gives a new set, as
+# the binary operator does, and anything else is an error.
+s = {'a', 'c'}
+alias = s
+s |= {'b': 1, 'c': 2}.keys()
+assert s == {'a', 'b', 'c'}
+assert alias == {'a', 'c'}
+for operand in ([1], 'ab', None):
+    s = {1}
+    try:
+        s |= operand
+        assert False, 'expected TypeError'
+    except TypeError:
+        pass
+    assert s == {1}
+
+# A frozenset is immutable, so its in-place operators still build a new frozenset.
+f = frozenset({1, 2})
+alias = f
+f |= {3}
+assert f == frozenset({1, 2, 3})
+assert alias == frozenset({1, 2})
+
+# === intersection_update / difference_update / symmetric_difference_update ===
+s = {1, 2, 3, 4}
+alias = s
+assert s.intersection_update([2, 3, 4, 5], (3, 4, 6)) is None
+assert alias == {3, 4}
+s.difference_update({4}, 'x', [7])
+assert alias == {3}
+s.symmetric_difference_update(range(2, 5))
+assert alias == {2, 4}
+s.intersection_update()
+s.difference_update()
+assert alias == {2, 4}
+assert s is alias
+
+# === update() takes any number of iterables ===
+s = {1}
+s.update([2], (3,), {4: 'x'}, range(5, 7))
+assert s == {1, 2, 3, 4, 5, 6}
+s.update()
+assert s == {1, 2, 3, 4, 5, 6}
+
+for compute, message in [
+    (lambda: {1}.intersection_update([1], 2), "'int' object is not iterable"),
+    (lambda: {1}.difference_update(None), "'NoneType' object is not iterable"),
+    (
+        lambda: {1}.symmetric_difference_update(),
+        'set.symmetric_difference_update() takes exactly one argument (0 given)',
+    ),
+    (
+        lambda: {1}.symmetric_difference_update([1], [2]),
+        'set.symmetric_difference_update() takes exactly one argument (2 given)',
+    ),
+    (lambda: {1}.update([2], 3), "'int' object is not iterable"),
+]:
+    try:
+        compute()
+        assert False, f'expected TypeError: {message}'
+    except TypeError as e:
+        assert str(e) == message
+
+# On an error part way, intersection_update changes nothing (CPython swaps the
+# result in at the end), while difference_update keeps the operands it applied.
+s = {1, 2, 3}
+try:
+    s.intersection_update([1, 2], 5)
+    assert False, 'expected TypeError'
+except TypeError:
+    pass
+assert s == {1, 2, 3}
+try:
+    s.difference_update([1], 5)
+    assert False, 'expected TypeError'
+except TypeError:
+    pass
+assert s == {2, 3}
+
 # === Issubset ===
 s1 = set([1, 2])
 s2 = set([1, 2, 3])
