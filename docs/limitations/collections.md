@@ -80,7 +80,7 @@ divergences. `repr(Point)` is `<class 'Point'>` where CPython gives
 (`'deque'`); Monty matches both
 surfaces.
 
-`Counter` is a Python-level class, so CPython gives the bare name everywhere
-except `repr(Counter)`, which is `<class 'collections.Counter'>` where Monty
-writes `<class 'Counter'>`. Everywhere else — `__name__`, the `cannot use ...`
-unhashable clause, other type-naming errors — the bare name matches.
+`Counter` is a Python-level class, so CPython gives the bare name everywhere except `repr(Counter)`, which is
+`<class 'collections.Counter'>` where Monty writes `<class 'Counter'>`, and the first clause of an unhashable-key
+error (`cannot use 'collections.Counter' as a dict key (unhashable type: 'Counter')`), which Monty matches.
+Everywhere else — `__name__`, other type-naming errors — the bare name matches.

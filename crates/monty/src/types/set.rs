@@ -1786,7 +1786,7 @@ pub(crate) fn set_element_hash(value: &Value, vm: &mut VM<'_>) -> RunResult<u64>
     if let Some(hash) = value.py_hash(vm)? {
         Ok(hash.raw())
     } else {
-        let element_type = value.py_type_name(vm).into_owned();
+        let element_type = qualified_type_name(value, vm);
         let unhashable_type = unhashable_type_name(value, vm)?;
         Err(ExcType::type_error_unhashable_set_element(
             &element_type,
@@ -1795,8 +1795,21 @@ pub(crate) fn set_element_hash(value: &Value, vm: &mut VM<'_>) -> RunResult<u64>
     }
 }
 
+/// The type of `value` as CPython's `%T` writes it in a `cannot use '...'` error:
+/// qualified by its module unless that is `builtins` or `__main__`.
+///
+/// Of Monty's unhashable types, only `Counter`, a Python-level class in CPython,
+/// needs the prefix added; the C types (`collections.deque`, ...) carry it already.
+pub(crate) fn qualified_type_name(value: &Value, vm: &VM<'_>) -> String {
+    if value.py_type(vm) == Type::Counter {
+        "collections.Counter".to_owned()
+    } else {
+        value.py_type_name(vm).into_owned()
+    }
+}
+
 /// Finds the nested value responsible for a tuple-like element being unhashable.
-fn unhashable_type_name(value: &Value, vm: &mut VM<'_>) -> RunResult<String> {
+pub(crate) fn unhashable_type_name(value: &Value, vm: &mut VM<'_>) -> RunResult<String> {
     let Value::Ref(id) = value else {
         return Ok(value.py_type_name(vm).into_owned());
     };

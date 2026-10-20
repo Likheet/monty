@@ -24,6 +24,7 @@ use crate::{
     types::{
         Dict, LazyHeapSet, NamedTuple, PyTrait, Type,
         hash_table::{PyHashTable, Slot, TableEntry, TableProbe, TableSource},
+        set::{qualified_type_name, unhashable_type_name},
         tuple::{TupleVec, allocate_tuple},
     },
     value::{EitherStr, Value},
@@ -234,9 +235,14 @@ struct StoreArgs {
 
 /// Hashes a cache key before entering the mutation-aware table probe.
 fn key_hash(key: &Value, vm: &mut VM<'_>) -> RunResult<u64> {
-    key.py_hash(vm)?
-        .map(HashValue::raw)
-        .ok_or_else(|| ExcType::type_error_unhashable_dict_key(&key.py_type_name(vm)))
+    if let Some(hash) = key.py_hash(vm)? {
+        return Ok(hash.raw());
+    }
+    let unhashable_type = unhashable_type_name(key, vm)?;
+    Err(ExcType::type_error_unhashable_dict_key(
+        &qualified_type_name(key, vm),
+        &unhashable_type,
+    ))
 }
 
 /// Stores a successful frozen call's result. Consumes the key; borrows the wrapper and value.
@@ -358,7 +364,11 @@ fn make_key(positional: &[Value], keywords: &[(Value, Value)], typed: bool, vm: 
 fn unhashable_argument_error(positional: &[Value], keywords: &[(Value, Value)], vm: &mut VM<'_>) -> RunError {
     for value in positional.iter().chain(keywords.iter().map(|(_, value)| value)) {
         if matches!(value.py_hash(vm), Ok(None)) {
-            return ExcType::type_error_unhashable(&value.py_type_name(vm));
+            // A tuple argument names its own unhashable element, as in CPython.
+            return match unhashable_type_name(value, vm) {
+                Ok(unhashable_type) => ExcType::type_error_unhashable(&unhashable_type),
+                Err(err) => err,
+            };
         }
     }
     ExcType::type_error_unhashable("tuple")
