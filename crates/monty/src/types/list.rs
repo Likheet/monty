@@ -709,16 +709,26 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, List> {
         let Some(count) = repeat_count(other, vm)? else {
             return Ok(false);
         };
+        let len = self.get(vm.heap).items.len();
         if count == 0 {
             mem::take(&mut self.get_mut(vm.heap).items).drop_with(vm);
-        } else if count > 1 {
+        } else if count > 1 && len > 0 {
+            check_repeat_size(len.saturating_mul(VALUE_SIZE), count, &vm.heap.tracker)?;
+            // Without a memory limit the check above accepts any count, so the new
+            // capacity must still be possible: CPython raises `MemoryError` here.
+            let mut repeated = Vec::new();
+            len.checked_mul(count - 1)
+                .and_then(|extra| repeated.try_reserve_exact(extra).ok())
+                .ok_or_else(ExcType::allocation_too_large)?;
+            // Guarded, so the clones are released if the time limit stops the loop.
+            let mut guard = DropGuard::new(repeated, vm);
+            let (repeated, vm) = guard.as_parts_mut();
             let value = self.get(vm.heap);
-            check_repeat_size(value.len().saturating_mul(VALUE_SIZE), count, &vm.heap.tracker)?;
-            let mut repeated = Vec::with_capacity(value.len() * (count - 1));
             for rep in 1..count {
                 repeated.extend(value.as_slice().iter().map(|value| value.clone_with_heap(vm.heap)));
                 vm.heap.tracker.check_time_every(rep)?;
             }
+            let (repeated, vm) = guard.into_parts();
             self.get_mut(vm.heap).items.extend(repeated);
         }
         Ok(true)

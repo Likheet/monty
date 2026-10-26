@@ -101,6 +101,12 @@ nested = [[0]]
 nested *= 3
 assert nested == [[0], [0], [0]]
 assert nested[0] is nested[2]
+# An empty list stays empty for any count, without repeating anything.
+empty = []
+alias = empty
+alias *= 2**62
+assert empty == []
+assert alias is empty
 
 # === list() constructor ===
 assert list() == []

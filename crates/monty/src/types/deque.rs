@@ -620,14 +620,19 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Deque> {
         let source: Vec<Value> = if count == 0 {
             Vec::new()
         } else {
+            vm.heap
+                .tracker
+                .check_allocation(deque.items.len().saturating_mul(VALUE_SIZE))?;
             deque.iter().map(|v| v.clone_with_heap(vm.heap)).collect()
         };
         let items = repeat_deque_items(source, maxlen, count, vm)?;
+        // `VecDeque::from` takes over the buffer of `items`, so nothing is allocated
+        // after the deque changes, and a live iterator sees the change only once the
+        // new items are in place.
         let deque = self.get_mut(vm.heap);
+        let old = mem::replace(&mut deque.items, VecDeque::from(items));
         deque.bump_state();
-        let old: Vec<Value> = deque.items.drain(..).collect();
-        deque.items.extend(items);
-        old.drop_with(vm);
+        Vec::from(old).drop_with(vm);
         Ok(true)
     }
 
