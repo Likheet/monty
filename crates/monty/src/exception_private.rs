@@ -3044,7 +3044,6 @@ impl RunError {
     }
 }
 
-/// CPython's `ModuleNotFoundError` message for `module_name`.
 /// The name CPython's positional-count errors use, which never carries the type
 /// or module: `[1].pop(0, 1)` raises `pop expected at most 1 argument, got 2`.
 ///
@@ -3054,6 +3053,7 @@ fn bare_function_name(name: &str) -> &str {
     name.rsplit_once('.').map_or(name, |(_, function)| function)
 }
 
+/// CPython's `ModuleNotFoundError` message for `module_name`.
 fn no_module_named(module_name: &str) -> String {
     format!("No module named '{module_name}'")
 }
