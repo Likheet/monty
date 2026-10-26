@@ -97,7 +97,7 @@ invalid_cases = [
     # an invalid literal or number is reported at its start
     ('nul', 'Expecting value: line 1 column 1 (char 0)'),
     ('nan', 'Expecting value: line 1 column 1 (char 0)'),
-    ('[t]', 'Expecting value: line 1 column 2 (char 1)'),
+    ('[trux]', 'Expecting value: line 1 column 2 (char 1)'),
     ('{"a": nulx}', 'Expecting value: line 1 column 7 (char 6)'),
     ('-', 'Expecting value: line 1 column 1 (char 0)'),
     ('[-x]', 'Expecting value: line 1 column 2 (char 1)'),
