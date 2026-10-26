@@ -81,6 +81,7 @@ divergences. `repr(Point)` is `<class 'Point'>` where CPython gives
 surfaces.
 
 `Counter` is a Python-level class, so CPython gives the bare name everywhere except `repr(Counter)`, which is
-`<class 'collections.Counter'>` where Monty writes `<class 'Counter'>`, and the first clause of an unhashable-key
-error (`cannot use 'collections.Counter' as a dict key (unhashable type: 'Counter')`), which Monty matches.
-Everywhere else — `__name__`, other type-naming errors — the bare name matches.
+`<class 'collections.Counter'>` where Monty writes `<class 'Counter'>`, and the first clause of an unhashable dict
+key or set element error (`cannot use 'collections.Counter' as a dict key (unhashable type: 'Counter')`, and the
+same with `as a set element`), which Monty matches. Everywhere else — `__name__`, other type-naming errors — the bare
+name matches.

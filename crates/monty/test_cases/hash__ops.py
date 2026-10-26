@@ -191,3 +191,31 @@ for compute, expected in [
         assert False, 'expected TypeError'
     except TypeError as e:
         assert str(e) == expected
+
+
+# The walk that names the element runs no user `__hash__` a second time.
+hash_calls = []
+
+
+class CountedHash:
+    def __hash__(self):
+        hash_calls.append(1)
+        return 1
+
+
+for compute, expected, calls in [
+    (lambda: {(CountedHash(), [2]): 3}, "cannot use 'tuple' as a dict key (unhashable type: 'list')", 1),
+    (
+        lambda: {(CountedHash(), (CountedHash(), {}))},
+        "cannot use 'tuple' as a set element (unhashable type: 'dict')",
+        2,
+    ),
+    (lambda: hash((CountedHash(), [2])), "unhashable type: 'list'", 1),
+]:
+    hash_calls.clear()
+    try:
+        compute()
+        assert False, 'expected TypeError'
+    except TypeError as e:
+        assert str(e) == expected
+    assert len(hash_calls) == calls

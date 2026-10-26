@@ -16,11 +16,15 @@ use crate::{
         heap_read_ref_as_field_mut,
     },
     intern::StaticStrings,
-    modules::copy::{Memo, PyDeepCopy, deep_copy},
+    modules::{
+        copy::{Memo, PyDeepCopy, deep_copy},
+        dataclasses,
+    },
     py_value::PyValue,
     types::{
         LazyHeapSet, Type,
         hash_table::{Live, PyHashTable, TableCursor, TableEntry, TableProbe, TableSource, TableWalk},
+        instance::class_defines_not_none,
         list::repr_items_fmt,
     },
     value::{EitherStr, VALUE_SIZE, Value},
@@ -1809,14 +1813,39 @@ pub(crate) fn qualified_type_name(value: &Value, vm: &VM<'_>) -> String {
 }
 
 /// Finds the nested value responsible for a tuple-like element being unhashable.
+///
+/// The failed hash reports only that some element is unhashable, so this walks
+/// the elements again and names the innermost one, as CPython's error does.
 pub(crate) fn unhashable_type_name(value: &Value, vm: &mut VM<'_>) -> RunResult<String> {
+    match first_unhashable_element(value, vm)? {
+        Some(name) => Ok(name),
+        None => Ok(value.py_type_name(vm).into_owned()),
+    }
+}
+
+/// The type name of the innermost unhashable element of `value`, or `None` when
+/// the walk finds none.
+///
+/// CPython hashes each element once, so the walk runs only native hashes: an
+/// instance with a user or dataclass `__hash__` already hashed without an error
+/// (a failing one raises rather than reporting unhashable), and is skipped.
+fn first_unhashable_element(value: &Value, vm: &mut VM<'_>) -> RunResult<Option<String>> {
     let Value::Ref(id) = value else {
-        return Ok(value.py_type_name(vm).into_owned());
+        return Ok(None);
     };
     let len = match vm.heap.get(*id) {
         HeapData::Tuple(tuple) => tuple.as_slice().len(),
         HeapData::NamedTuple(namedtuple) => namedtuple.as_vec().len(),
-        _ => return Ok(value.py_type_name(vm).into_owned()),
+        HeapData::Instance(instance)
+            if dataclasses::generated_fields(instance.class(), "__hash__", vm).is_some()
+                || class_defines_not_none(instance.class(), "__hash__", vm) =>
+        {
+            return Ok(None);
+        }
+        _ => {
+            let unhashable = value.py_hash(vm)?.is_none();
+            return Ok(unhashable.then(|| value.py_type_name(vm).into_owned()));
+        }
     };
 
     for index in 0..len {
@@ -1826,12 +1855,11 @@ pub(crate) fn unhashable_type_name(value: &Value, vm: &mut VM<'_>) -> RunResult<
             _ => unreachable!("tuple-like heap value changed type"),
         };
         defer_drop!(item, vm);
-        if item.py_hash(vm)?.is_none() {
-            return unhashable_type_name(item, vm);
+        if let Some(name) = first_unhashable_element(item, vm)? {
+            return Ok(Some(name));
         }
     }
-
-    Ok(value.py_type_name(vm).into_owned())
+    Ok(None)
 }
 
 impl<'h> PyDeepCopy<'h> for HeapRead<'h, Set> {
