@@ -315,8 +315,7 @@ struct ScopeFlags {
 enum AwaitRule {
     /// Module top level (top-level await) and `async def` bodies.
     Allowed,
-    /// Snippet top level and its class bodies, and class bodies in a sync function:
-    /// `'await' outside function`.
+    /// Snippet top level and every class body: `'await' outside function`.
     OutsideFunction,
     /// The body of a `def` or `lambda` that is not `async`: `'await' outside async function`.
     OutsideAsyncFunction,
@@ -1040,13 +1039,10 @@ impl<'a, 'i> Compiler<'a, 'i> {
         class_name: &Identifier,
         position: CodeRange,
     ) -> Result<(), CompileError> {
-        // A class body is not a function, so in a sync function CPython reports
-        // `'await' outside function` for it.
+        // A class body is not a function, so CPython reports `'await' outside function`
+        // for it everywhere, also in an `async def` and with top-level await.
         let flags = ScopeFlags {
-            await_rule: match self.flags.await_rule {
-                AwaitRule::OutsideAsyncFunction => AwaitRule::OutsideFunction,
-                rule => rule,
-            },
+            await_rule: AwaitRule::OutsideFunction,
             ..self.flags
         };
         self.emit_make_callable(body, "class body", |interns, namespace_size| {

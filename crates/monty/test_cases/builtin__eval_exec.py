@@ -151,6 +151,7 @@ for source, message in [
     ('async def f():\n    def h():\n        return await g()', "'await' outside async function (<string>, line 3)"),
     ('class C:\n    def m(self):\n        return await g()', "'await' outside async function (<string>, line 3)"),
     ('def f():\n    class C:\n        x = await g()', "'await' outside function (<string>, line 3)"),
+    ('async def f():\n    class C:\n        x = await g()', "'await' outside function (<string>, line 3)"),
     ('def f():\n    return [x for x in await g()]', "'await' outside async function (<string>, line 2)"),
     ('def f():\n    return [lambda: await g() for x in y]', "'await' outside async function (<string>, line 2)"),
     (
