@@ -714,6 +714,10 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, List> {
             mem::take(&mut self.get_mut(vm.heap).items).drop_with(vm);
         } else if count > 1 && len > 0 {
             check_repeat_size(len.saturating_mul(VALUE_SIZE), count, &vm.heap.tracker)?;
+            // Checked at 2× the added items — the temporary clone plus the equal-sized
+            // target growth — as for a list extended by itself in `py_iadd_impl`.
+            let added = len.saturating_mul(count - 1);
+            vm.heap.tracker.check_allocation(added.saturating_mul(2 * VALUE_SIZE))?;
             // Without a memory limit the check above accepts any count, so the new
             // capacity must still be possible: CPython raises `MemoryError` here.
             let mut repeated = Vec::new();
