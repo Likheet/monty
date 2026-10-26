@@ -507,6 +507,7 @@ assert datetime.date(9999, 12, 31).toordinal() == 3652059
 assert datetime.datetime(2020, 5, 17, 13, 45, tzinfo=datetime.timezone.utc).toordinal() == 737562
 assert datetime.date.fromordinal(1) == datetime.date(1, 1, 1)
 assert datetime.date.fromordinal(737484) == datetime.date(2020, 2, 29)
+assert datetime.date.fromordinal(3652059) == datetime.date(9999, 12, 31)
 assert datetime.date.fromordinal(True) == datetime.date(1, 1, 1)
 assert repr(datetime.datetime.fromordinal(737484)) == 'datetime.datetime(2020, 2, 29, 0, 0)'
 for call, error in [
