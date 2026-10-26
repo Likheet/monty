@@ -30,6 +30,7 @@ use crate::{
         instance::{class_defines, instance_getattr, instance_str, instance_user_eq},
         long_int::{
             PyInt, bigint_cmp_f64, bigint_cmp_i64, bigint_divmod_tuple, bigint_eq_f64, bigint_eq_i64, i64_cmp_f64,
+            repeat_count,
         },
         namedtuple::cmp_item_seqs,
         str::{PyStr, allocate_string},
@@ -1627,6 +1628,13 @@ impl Value {
     fn repeat_by_index(&self, count: &Self, vm: &mut VM<'_>) -> RunResult<Self> {
         if let Some(index) = count.py_index_impl(vm)? {
             defer_drop!(index, vm);
+            // CPython names the object it asked, not the `int` it got back, when the count is too large.
+            if repeat_count(index, vm).is_err() {
+                return Err(ExcType::overflow_error(format!(
+                    "cannot fit '{}' into an index-sized integer",
+                    count.py_type_name(vm)
+                )));
+            }
             if let Some(result) = self.py_mul_impl(index, vm)? {
                 return Ok(result);
             }

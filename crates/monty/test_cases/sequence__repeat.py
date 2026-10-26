@@ -97,3 +97,24 @@ except ValueError as exc:
     assert str(exc) == 'no count'
 assert multiply_error('ab', Count('2')) == '__index__ returned non-int (type str)'
 assert multiply_error(Count(None), (1,)) == '__index__ returned non-int (type NoneType)'
+
+
+# === A count too large for an index names the count's type ===
+def overflow_error(left, right):
+    try:
+        left * right
+        assert False, 'expected multiplication to raise OverflowError'
+    except OverflowError as exc:
+        return str(exc)
+
+
+for sequence, _ in sequences:
+    assert overflow_error(sequence, Count(2**100)) == "cannot fit 'Count' into an index-sized integer"
+    assert overflow_error(Count(2**100), sequence) == "cannot fit 'Count' into an index-sized integer"
+    assert overflow_error(sequence, 2**100) == "cannot fit 'int' into an index-sized integer"
+repeated = [1]
+try:
+    repeated *= Count(2**100)
+    assert False, 'expected augmented multiplication to raise OverflowError'
+except OverflowError as exc:
+    assert str(exc) == "cannot fit 'Count' into an index-sized integer"
