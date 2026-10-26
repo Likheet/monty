@@ -377,6 +377,32 @@ try:
 except OverflowError as exc:
     assert str(exc) == 'Python int too large to convert to C ssize_t'
 
+
+# The index goes through `__index__`, and its error also wins over a full deque.
+class InsertIndex:
+    def __init__(self, value):
+        self.value = value
+
+    def __index__(self):
+        if self.value is None:
+            raise ValueError('no index')
+        return self.value
+
+
+d = deque([1, 2])
+d.insert(InsertIndex(1), 9)
+assert d == deque([1, 9, 2])
+try:
+    deque([1], maxlen=1).insert(InsertIndex(0), 99)
+    assert False, 'expected a full deque to fail'
+except IndexError as exc:
+    assert str(exc) == 'deque already at its maximum size'
+try:
+    deque([1], maxlen=1).insert(InsertIndex(None), 99)
+    assert False, 'expected the __index__ error'
+except ValueError as exc:
+    assert str(exc) == 'no index'
+
 try:
     d = deque([1])
     d.maxlen = 3
