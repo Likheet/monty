@@ -637,13 +637,6 @@ pub(crate) fn sub_with_function(
     vm: &mut VM<'_>,
 ) -> RunResult<Value> {
     defer_drop!(matches, vm);
-    let match_at = |index: usize, vm: &VM<'_>| match matches {
-        Value::Ref(id) => match vm.heap.get(*id) {
-            HeapData::List(list) => list.as_slice().get(index).map(|m| m.clone_with_heap(vm)),
-            _ => None,
-        },
-        _ => None,
-    };
     let text_len = subject.to_str(vm)?.len();
     let limit = if count == 0 { usize::MAX } else { count };
 
@@ -654,10 +647,10 @@ pub(crate) fn sub_with_function(
     let mut item = 0;
     let mut first_bad: Option<(usize, String)> = None;
     for index in 0..limit {
-        let Some(m) = match_at(index, vm) else {
+        let Some(m) = match_at(matches, index, vm) else {
             break;
         };
-        let (start, end) = match &m {
+        let (start, end) = match m {
             Value::Ref(id) => match vm.heap.get(*id) {
                 HeapData::ReMatch(m) => m.byte_span(),
                 _ => unreachable!("finditer builds a list of matches"),
@@ -668,6 +661,8 @@ pub(crate) fn sub_with_function(
             push_checked(&mut result, &subject.to_str(vm)?[last_end..start], vm)?;
             item += 1;
         }
+        // Clone the match only here, so that an error above has no reference to release.
+        let m = m.clone_with_heap(vm);
         let replacement = vm.evaluate_function(repl, ArgValues::One(m))?;
         defer_drop!(replacement, vm);
         if !matches!(replacement, Value::None) {
@@ -693,6 +688,18 @@ pub(crate) fn sub_with_function(
     }
     push_checked(&mut result, &subject.to_str(vm)?[last_end..], vm)?;
     Ok(allocate_string(result, vm.heap))
+}
+
+/// The match at `index` in the list that [`RePattern::finditer_limit`] built,
+/// or `None` after the last one.
+fn match_at<'v>(matches: &Value, index: usize, vm: &'v VM<'_>) -> Option<&'v Value> {
+    match matches {
+        Value::Ref(id) => match vm.heap.get(*id) {
+            HeapData::List(list) => list.as_slice().get(index),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Appends `piece` to `result` after the same growth check as [`StringBuilder::push_str`].
