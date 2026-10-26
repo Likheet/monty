@@ -302,7 +302,8 @@ fn call_sub(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     if let Some(template) = template {
         resolved.get(vm.heap).sub(template, text, count, vm.heap)
     } else {
-        let matches = resolved.get(vm.heap).finditer(string, text, vm.heap)?;
+        let limit = if count == 0 { usize::MAX } else { count };
+        let matches = resolved.get(vm.heap).finditer_limit(string, text, limit, vm.heap)?;
         sub_with_function(matches, repl, string, count, vm)
     }
 }

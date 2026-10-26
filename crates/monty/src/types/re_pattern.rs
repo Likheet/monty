@@ -23,6 +23,7 @@ use crate::{
     intern::StaticStrings,
     modules::re::{ASCII, DOTALL, IGNORECASE, MULTILINE},
     resource_checks::check_estimated_size,
+    string_builder::StringBuilder,
     types::{
         LazyHeapSet, List, PyTrait, ReMatch, Type, allocate_tuple,
         str::{allocate_string, string_repr_fmt},
@@ -368,11 +369,17 @@ impl RePattern {
     /// lazy iterator but produces the same results when iterated. The VM's `GetIter`
     /// opcode handles iteration over the returned list.
     pub fn finditer(&self, subject: &Value, text: &str, heap: &Heap) -> RunResult<Value> {
+        self.finditer_limit(subject, text, usize::MAX, heap)
+    }
+
+    /// [`Self::finditer`] that stops after `limit` matches, so that `sub()` with a
+    /// `count` and a function replacement does not collect matches it will not use.
+    pub fn finditer_limit(&self, subject: &Value, text: &str, limit: usize, heap: &Heap) -> RunResult<Value> {
         // Every match shares one refcounted subject reference, not a copy each.
         let all_ascii = text.is_ascii();
 
         let mut results = Vec::new();
-        for caps in self.compiled.captures_iter(text) {
+        for caps in self.compiled.captures_iter(text).take(limit) {
             check_results_growth(&results, heap)?;
             let caps = caps.map_err(ExcType::re_pattern_error)?;
             results.push(self.build_match(&caps, subject, all_ascii, heap));
@@ -594,7 +601,8 @@ fn call_pattern_sub<'h>(pattern: &HeapRead<'h, RePattern>, args: ArgValues, vm: 
     if let Some(template) = template {
         pattern.get(vm.heap).sub(template, text, count, vm.heap)
     } else {
-        let matches = pattern.get(vm.heap).finditer(string_val, text, vm.heap)?;
+        let limit = if count == 0 { usize::MAX } else { count };
+        let matches = pattern.get(vm.heap).finditer_limit(string_val, text, limit, vm.heap)?;
         sub_with_function(matches, repl_val, string_val, count, vm)
     }
 }
@@ -617,7 +625,7 @@ pub(crate) fn sub_template<'a>(repl: &'a Value, vm: &'a VM<'_>) -> RunResult<Opt
 /// `sub()` with a function as `repl`: each of the first `count` matches (all
 /// of them when `count` is 0) is replaced by `repl(match)`, in order.
 ///
-/// `matches` is the list that [`RePattern::finditer`] built, made up front
+/// `matches` is the list that [`RePattern::finditer_limit`] built, made up front
 /// because a call needs the whole VM while the pattern borrows the heap. As in
 /// CPython's `pattern_subx`, a `None` result adds nothing, and a result that is
 /// not a `str` fails only after every call has run, when the pieces are joined.
@@ -657,14 +665,14 @@ pub(crate) fn sub_with_function(
             _ => unreachable!("finditer builds a list of matches"),
         };
         if start > last_end {
-            result.push_str(&subject.to_str(vm)?[last_end..start]);
+            push_checked(&mut result, &subject.to_str(vm)?[last_end..start], vm)?;
             item += 1;
         }
         let replacement = vm.evaluate_function(repl, ArgValues::One(m))?;
         defer_drop!(replacement, vm);
         if !matches!(replacement, Value::None) {
             match replacement.to_str(vm) {
-                Ok(text) => result.push_str(text),
+                Ok(text) => push_checked(&mut result, text, vm)?,
                 Err(_) => {
                     if first_bad.is_none() {
                         first_bad = Some((item, replacement.py_type_name(vm).into_owned()));
@@ -683,8 +691,19 @@ pub(crate) fn sub_with_function(
             "sequence item {item}: expected str instance, {type_name} found"
         )));
     }
-    result.push_str(&subject.to_str(vm)?[last_end..]);
+    push_checked(&mut result, &subject.to_str(vm)?[last_end..], vm)?;
     Ok(allocate_string(result, vm.heap))
+}
+
+/// Appends `piece` to `result` after the same growth check as [`StringBuilder::push_str`].
+///
+/// A builder cannot live across the calls to the replacement function, which need
+/// the whole VM, so each append wraps the string for that one push.
+fn push_checked(result: &mut String, piece: &str, vm: &VM<'_>) -> RunResult<()> {
+    let mut builder = StringBuilder::from_existing(mem::take(result), &vm.heap.tracker);
+    builder.push_str(piece)?;
+    *result = builder.finish_raw()?;
+    Ok(())
 }
 
 /// Handles `pattern.split(string, maxsplit=0)` argument extraction and dispatch.
