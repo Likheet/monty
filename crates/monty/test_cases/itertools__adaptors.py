@@ -163,10 +163,19 @@ try:
 except TypeError as exc:
     assert str(exc) == 'islice() takes no keyword arguments'
 
-# CPython reads a bound that is not an index as -1 and checks a stop of -1 first,
-# so which error a bad bound gets depends on its slot and value.
+# CPython reads a bound that is not an index, or whose `__index__` raises, as -1
+# and checks a stop of -1 first, so which error a bad bound gets depends on its
+# slot and value.
 ISLICE_STOP = 'Stop argument for islice() must be None or an integer: 0 <= x <= sys.maxsize.'
 ISLICE_INDICES = 'Indices for islice() must be None or an integer: 0 <= x <= sys.maxsize.'
+ISLICE_STEP = 'Step for islice() must be a positive integer or None.'
+
+
+class RaisingIndex:
+    def __index__(self):
+        raise RuntimeError('no index')
+
+
 for args, message in [
     ((-5,), ISLICE_INDICES),
     (('x',), ISLICE_STOP),
@@ -178,6 +187,9 @@ for args, message in [
     ((2**63, 2), ISLICE_INDICES),
     ((0, -1, 0), ISLICE_STOP),
     ((-1, 2, 0), ISLICE_INDICES),
+    ((RaisingIndex(),), ISLICE_STOP),
+    ((RaisingIndex(), 2), ISLICE_INDICES),
+    ((0, 2, RaisingIndex()), ISLICE_STEP),
 ]:
     try:
         itertools.islice([1], *args)

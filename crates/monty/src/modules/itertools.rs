@@ -359,22 +359,28 @@ fn islice_bounds(
     if step < 1 {
         return Err(ExcType::islice_bad_step());
     }
-    let start = usize::try_from(start).expect("start checked non-negative");
+    let start = usize::try_from(start).expect("a checked start is non-negative and fits `isize`");
     let stop = usize::try_from(stop).ok();
-    let step = usize::try_from(step).expect("step checked positive");
+    let step = usize::try_from(step).expect("a checked step is positive and fits `isize`");
     Ok((start, stop, step))
 }
 
 /// Reads one `islice` bound as CPython's `PyNumber_AsSsize_t` does: `None` gives
-/// `default`, and a value that is not an index, or is out of `i64` range, reads as
+/// `default`, and a value that is not an index, or is out of `isize` range, reads as
 /// `-1` (CPython clears that failure and lets the bound checks report it).
+///
+/// `isize` is the width of `Py_ssize_t` on a CPython build for the same target, so
+/// on a 32-bit target such as wasm32 a bound past `i32` fails the same checks, and
+/// every bound that passes them fits `usize`.
 fn islice_index(value: &Value, default: i64, vm: &mut VM<'_>) -> RunResult<i64> {
     match value {
         Value::None => Ok(default),
         Value::Bool(b) => Ok(i64::from(*b)),
-        // A raising `__index__` propagates; only a type mismatch reads as `-1`.
+        // CPython clears every conversion error, also one that `__index__` raises,
+        // so any Python exception reads as `-1`. Only an uncatchable or internal
+        // error propagates.
         other => match other.as_int(vm) {
-            Ok(index) => Ok(index),
+            Ok(index) => Ok(if isize::try_from(index).is_ok() { index } else { -1 }),
             Err(RunError::Exc(_)) => Ok(-1),
             Err(e) => Err(e),
         },
