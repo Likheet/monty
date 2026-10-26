@@ -647,6 +647,10 @@ pub(crate) fn sub_with_function(
     let mut item = 0;
     let mut first_bad: Option<(usize, String)> = None;
     for index in 0..limit {
+        // Each call re-enters `run()` with a fresh dispatch countdown, so a short
+        // `repl` reaches no checkpoint. Poll for every match: with nested `sub()`
+        // calls, few matches at each level can still make many calls in all.
+        vm.heap.tracker.check_time()?;
         let Some(m) = match_at(matches, index, vm) else {
             break;
         };
