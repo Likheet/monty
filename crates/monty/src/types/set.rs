@@ -932,6 +932,8 @@ impl<'h> HeapReadMut<'h, Set> {
     fn algebra_update_each(&self, others: ArgPosIter, op: SetAlgebra, vm: &mut VM<'h>) -> RunResult<()> {
         defer_drop_mut!(others, vm);
         loop {
+            // As in `update`: poll the clock before each operand's pass.
+            vm.heap.tracker.check_memory_time()?;
             let Some(other) = others.next() else {
                 return Ok(());
             };
@@ -970,6 +972,11 @@ impl<'h> HeapRead<'h, Set> {
         defer_drop_mut!(others, vm);
         let mut result = clone_storage_checked(&self.get(vm.heap).0, vm)?;
         loop {
+            // As in `update`: poll the clock before each operand's pass.
+            if let Err(error) = vm.heap.tracker.check_memory_time() {
+                result.drop_with(vm);
+                return Err(error.into());
+            }
             let Some(other) = others.next() else {
                 return Ok(result);
             };
@@ -1356,6 +1363,9 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Set> {
                 let others = args.into_pos_only("set.update", vm.heap)?;
                 defer_drop_mut!(others, vm);
                 loop {
+                    // Each operand is a full pass, so poll the clock before taking the next
+                    // one; on a timeout the guard releases the operands not reached.
+                    vm.heap.tracker.check_memory_time()?;
                     let Some(other) = others.next() else {
                         break Ok(Value::None);
                     };
