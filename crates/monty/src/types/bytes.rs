@@ -2085,7 +2085,10 @@ fn bytes_expandtabs<'h>(bytes: &impl HeapView<'h, [u8]>, args: ArgValues, vm: &m
     let bytes = bytes.get(vm.heap);
     let mut builder = BytesBuilder::with_capacity(bytes.len(), &vm.heap.tracker)?;
     let mut column = 0;
-    for &byte in bytes {
+    for (i, &byte) in bytes.iter().enumerate() {
+        // `push_repeated` polls the clock per chunk of one tab only, so many large
+        // tabs would otherwise expand without a time check
+        vm.heap.tracker.check_time_every(i)?;
         if byte == b'\t' {
             if tabsize > 0 {
                 let spaces = tabsize - (column % tabsize);
