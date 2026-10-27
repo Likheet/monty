@@ -345,3 +345,21 @@ try:
     assert False, 'expected TypeError'
 except TypeError as e:
     assert str(e) == 'range.index() takes no keyword arguments'
+try:
+    r.count(x=1)
+    assert False, 'expected TypeError'
+except TypeError as e:
+    assert str(e) == 'range.count() takes no keyword arguments'
+
+# === other attributes ===
+for call in [lambda: r.foo, lambda: r.foo()]:
+    try:
+        call()
+        assert False, 'expected AttributeError'
+    except AttributeError as e:
+        assert str(e) == "'range' object has no attribute 'foo'"
+try:
+    r.foo = 1
+    assert False, 'expected AttributeError'
+except AttributeError as e:
+    assert str(e) == "'range' object has no attribute 'foo' and no __dict__ for setting new attributes"
