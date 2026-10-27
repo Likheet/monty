@@ -338,22 +338,21 @@ pub(crate) fn py_sub_date(a: Date, b: Date, heap: &mut Heap) -> Option<Value> {
 /// `date + timedelta` helper.
 pub(crate) fn py_add(date: Date, delta: TimeDelta, heap: &mut Heap) -> RunResult<Value> {
     let (days, _, _) = timedelta::components(&delta);
-    let value = offset_days(date, i64::from(days))?;
+    let value = offset_days(date, days)?;
     Ok(Value::Ref(heap.allocate(HeapData::Date(value))))
 }
 
 /// `date - timedelta` helper.
 pub(crate) fn py_sub_timedelta(date: Date, delta: TimeDelta, heap: &mut Heap) -> RunResult<Value> {
     let (days, _, _) = timedelta::components(&delta);
-    let value = offset_days(date, -i64::from(days))?;
+    let value = offset_days(date, -days)?;
     Ok(Value::Ref(heap.allocate(HeapData::Date(value))))
 }
 
 /// The date `days` after `date`, or CPython's `OverflowError` outside years 1 to 9999.
-fn offset_days(date: Date, days: i64) -> RunResult<Date> {
-    let ordinal = i64::from(to_ordinal(date)) + days;
-    let ordinal = i32::try_from(ordinal).map_err(|_| date_value_out_of_range())?;
-    from_ordinal(ordinal)
+fn offset_days(date: Date, days: i32) -> RunResult<Date> {
+    // A timedelta has at most 999999999 days, so this cannot overflow `i32`
+    from_ordinal(to_ordinal(date) + days)
 }
 
 /// Formats a [`Date`] with a `strftime` directive string, shared by the
