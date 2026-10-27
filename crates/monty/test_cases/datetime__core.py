@@ -1157,6 +1157,7 @@ assert datetime.timedelta(microseconds=-1.5) == datetime.timedelta(days=-1, seco
 assert datetime.timedelta(microseconds=1, milliseconds=0.0005) == datetime.timedelta(microseconds=2)
 assert datetime.timedelta(seconds=1, microseconds=0.5) == datetime.timedelta(seconds=1)
 assert datetime.timedelta(days=999999999, microseconds=-0.5) == datetime.timedelta(days=999999999)
+assert datetime.timedelta(True, 0.5) == datetime.timedelta(days=1, microseconds=500000)
 
 # The components are added from microseconds up to weeks, so `seconds` fails first here.
 for kwargs, error, message in [
@@ -1166,6 +1167,9 @@ for kwargs, error, message in [
     ({'days': float('nan'), 'seconds': float('inf')}, 'OverflowError', 'cannot convert float infinity to integer'),
     ({'days': 1e9}, 'OverflowError', 'days=1000000000; must have magnitude <= 999999999'),
     ({'days': -1e9}, 'OverflowError', 'days=-1000000000; must have magnitude <= 999999999'),
+    ({'microseconds': 1e39}, 'OverflowError', 'Python int too large to convert to C int'),
+    ({'weeks': 1e30}, 'OverflowError', 'Python int too large to convert to C int'),
+    ({'microseconds': 1e38, 'milliseconds': 1e35}, 'OverflowError', 'Python int too large to convert to C int'),
 ]:
     try:
         datetime.timedelta(**kwargs)
