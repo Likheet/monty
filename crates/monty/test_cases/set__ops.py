@@ -135,6 +135,16 @@ alias = s
 s |= {'b': 1, 'c': 2}.keys()
 assert s == {'a', 'b', 'c'}
 assert alias == {'a', 'c'}
+keys = {'b': 1, 'c': 2}.keys()
+s = alias = {'a', 'c'}
+s &= keys
+assert (s, alias) == ({'c'}, {'a', 'c'})
+s = alias = {'a', 'c'}
+s -= keys
+assert (s, alias) == ({'a'}, {'a', 'c'})
+s = alias = {'a', 'c'}
+s ^= keys
+assert (s, alias) == ({'a', 'b'}, {'a', 'c'})
 for operand in ([1], 'ab', None):
     s = {1}
     try:
@@ -143,6 +153,17 @@ for operand in ([1], 'ab', None):
     except TypeError:
         pass
     assert s == {1}
+
+# Other types without an in-place `^` fall back to the binary operator
+x = 5
+x ^= 3
+assert x == 6
+items = [1]
+try:
+    items ^= [2]
+    assert False, 'expected TypeError'
+except TypeError:
+    pass
 
 # A frozenset is immutable, so its in-place operators still build a new frozenset.
 f = frozenset({1, 2})
@@ -184,6 +205,10 @@ for compute, message in [
         'set.symmetric_difference_update() takes exactly one argument (2 given)',
     ),
     (lambda: {1}.update([2], 3), "'int' object is not iterable"),
+    (lambda: {1}.symmetric_difference_update(2), "'int' object is not iterable"),
+    (lambda: {1}.update(x=1), 'set.update() takes no keyword arguments'),
+    (lambda: {1}.intersection_update(x=1), 'set.intersection_update() takes no keyword arguments'),
+    (lambda: {1}.difference_update(x=1), 'set.difference_update() takes no keyword arguments'),
 ]:
     try:
         compute()

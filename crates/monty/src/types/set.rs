@@ -904,18 +904,9 @@ impl<'h> HeapReadMut<'h, Set> {
 
     /// The in-place form of a set operation: `op` with `other` (any iterable)
     /// replaces the elements, as CPython's `set_swap_bodies` does, and the old
-    /// elements are released. Backs `intersection_update`, `difference_update` and
-    /// `symmetric_difference_update`.
+    /// elements are released. Backs `difference_update` and `symmetric_difference_update`.
     fn algebra_update(&self, other: Value, op: SetAlgebra, vm: &mut VM<'h>) -> RunResult<()> {
-        let other_storage = Set::get_storage_from_value(other, vm)?;
-        defer_drop!(other_storage, vm);
-        let other_storage = vm.heap.protect(other_storage);
-        let result = match op {
-            SetAlgebra::Union => self.storage().union(&other_storage, vm)?,
-            SetAlgebra::Intersection => self.storage().intersection(&other_storage, vm)?,
-            SetAlgebra::Difference => self.storage().difference(&other_storage, vm)?,
-            SetAlgebra::SymmetricDifference => self.storage().symmetric_difference(&other_storage, vm)?,
-        };
+        let result = self.algebra_storage(other, op, vm)?;
         self.replace_storage(result, vm);
         Ok(())
     }
@@ -996,22 +987,25 @@ impl<'h> HeapRead<'h, Set> {
     }
 
     /// Set algebra operations (union, intersection, difference, symmetric_difference)
-    /// via HeapRead. Snapshots the other operand once so only `self` is read
-    /// live, then calls the matching `SetStorage` method.
+    /// via HeapRead, as a new set.
     fn set_algebra(&self, other: Value, op: SetAlgebra, vm: &mut VM<'h>) -> RunResult<Value> {
+        let result = self.algebra_storage(other, op, vm)?;
+        let heap_id = vm.heap.allocate(HeapData::Set(Set(result)));
+        Ok(Value::Ref(heap_id))
+    }
+
+    /// The elements of `op` with `other` (any iterable). Snapshots the other operand
+    /// once so only `self` is read live, then calls the matching `SetStorage` method.
+    fn algebra_storage(&self, other: Value, op: SetAlgebra, vm: &mut VM<'h>) -> RunResult<SetStorage> {
         let other_storage = Set::get_storage_from_value(other, vm)?;
         defer_drop!(other_storage, vm);
         let other_storage = vm.heap.protect(other_storage);
-
-        let result = match op {
+        Ok(match op {
             SetAlgebra::Union => self.storage().union(&other_storage, vm)?,
             SetAlgebra::Intersection => self.storage().intersection(&other_storage, vm)?,
             SetAlgebra::Difference => self.storage().difference(&other_storage, vm)?,
             SetAlgebra::SymmetricDifference => self.storage().symmetric_difference(&other_storage, vm)?,
-        };
-
-        let heap_id = vm.heap.allocate(HeapData::Set(Set(result)));
-        Ok(Value::Ref(heap_id))
+        })
     }
 
     /// Set comparison operations (issubset, issuperset, isdisjoint) via HeapRead.
@@ -1281,9 +1275,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Set> {
         if !is_any_set(other, vm) {
             return Ok(false);
         }
-        let Some(mut other_storage) = get_storage_from_set_operand(other, vm)? else {
-            return Ok(false);
-        };
+        let mut other_storage = get_storage_from_set_operand(other, vm)?.expect("a set operand has storage");
         self.extend_from_entries(other_storage.table.take_entries(), vm)?;
         Ok(true)
     }
@@ -1292,9 +1284,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Set> {
         if !is_any_set(other, vm) {
             return Ok(false);
         }
-        let Some(Set(result)) = self.and_value(other, vm)? else {
-            return Ok(false);
-        };
+        let Set(result) = self.and_value(other, vm)?.expect("a set operand gives a set");
         self.replace_storage(result, vm);
         Ok(true)
     }
@@ -1303,9 +1293,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Set> {
         if !is_any_set(other, vm) {
             return Ok(false);
         }
-        let Some(Set(result)) = self.sub_value(other, vm)? else {
-            return Ok(false);
-        };
+        let Set(result) = self.sub_value(other, vm)?.expect("a set operand gives a set");
         self.replace_storage(result, vm);
         Ok(true)
     }
@@ -1314,9 +1302,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Set> {
         if !is_any_set(other, vm) {
             return Ok(false);
         }
-        let Some(Set(result)) = self.xor_value(other, vm)? else {
-            return Ok(false);
-        };
+        let Set(result) = self.xor_value(other, vm)?.expect("a set operand gives a set");
         self.replace_storage(result, vm);
         Ok(true)
     }
