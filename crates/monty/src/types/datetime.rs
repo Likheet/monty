@@ -499,10 +499,12 @@ pub(crate) fn class_fromisoformat(heap: &mut Heap, args: ArgValues, interns: &In
 /// `date.fromordinal()` gives, with no `tzinfo`.
 pub(crate) fn class_fromordinal(vm: &mut VM<'_>, args: ArgValues) -> RunResult<Value> {
     let day = date::date_from_ordinal_args(args, vm)?;
-    let (year, month, day) = date::to_ymd(day);
-    let month = i32::try_from(month).expect("month in 1..12");
-    let day = i32::try_from(day).expect("day in 1..31");
-    let datetime = from_components(year, month, day, 0, 0, 0, 0, None, None, vm.heap)?;
+    let datetime = DateTime {
+        naive: day.0.and_time(NaiveTime::MIN),
+        offset_seconds: None,
+        timezone_name: None,
+        tzinfo_ref: None,
+    };
     Ok(Value::Ref(vm.heap.allocate(HeapData::DateTime(datetime))))
 }
 

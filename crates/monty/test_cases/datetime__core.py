@@ -514,6 +514,8 @@ for call, error in [
     (lambda: datetime.date.fromordinal(0), 'ValueError: ordinal must be >= 1'),
     (lambda: datetime.datetime.fromordinal(-5), 'ValueError: ordinal must be >= 1'),
     (lambda: datetime.date.fromordinal(3652060), 'ValueError: year must be in 1..9999, not 10000'),
+    (lambda: datetime.date.fromordinal(3652425), 'ValueError: year must be in 1..9999, not 10000'),
+    (lambda: datetime.date.fromordinal(3653886), 'ValueError: year must be in 1..9999, not 10004'),
     (lambda: datetime.datetime.fromordinal(2**31 - 1), 'ValueError: year must be in 1..9999, not 5879611'),
     (lambda: datetime.date.fromordinal(2**70), 'OverflowError: Python int too large to convert to C long'),
     (lambda: datetime.date.fromordinal(1.5), "TypeError: 'float' object cannot be interpreted as an integer"),
