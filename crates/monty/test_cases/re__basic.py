@@ -192,6 +192,15 @@ assert re.findall(r'[$]', 'a$b') == ['$']
 assert re.findall(r'\$', 'a$') == ['$']
 assert re.findall(r'a(?#$)b', 'ab') == ['ab']
 assert re.findall(r'\\$', 'a\\\n') == ['\\']
+# a class may start with `^` or a literal `]`, and hold escapes
+assert re.findall(r'[^a]$', 'b\n') == ['b', '\n']
+assert re.findall(r'[]a]$', ']\n') == [']']
+assert re.findall(r'[\]]$', ']\n') == [']']
+# a $ after other groups and inline flags
+assert re.findall(r'(?:a)$', 'a\n') == ['a']
+assert re.findall(r'(?i)A$', 'a\n') == ['a']
+assert re.findall(r'(?i:A)$', 'a\n') == ['a']
+assert re.findall(r'(?s)a.$', 'a\n\n') == ['a\n']
 # the pattern keeps its own text
 assert re.compile(r'x$').pattern == 'x$'
 # a final $ applying to the whole pattern, as match() and fullmatch() see it
