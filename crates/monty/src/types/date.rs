@@ -109,7 +109,7 @@ pub(crate) fn from_ordinal(ordinal: i32) -> RunResult<Date> {
 
 /// CPython's `OverflowError` for arithmetic that leaves years 1 to 9999.
 pub(crate) fn date_value_out_of_range() -> RunError {
-    SimpleException::new_msg(ExcType::OverflowError, "date value out of range").into()
+    ExcType::overflow_error("date value out of range")
 }
 
 /// Returns the proleptic Gregorian ordinal (`1 == 0001-01-01`) for a date.

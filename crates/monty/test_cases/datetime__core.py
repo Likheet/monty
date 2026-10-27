@@ -104,6 +104,7 @@ for compute, message in [
     (lambda: datetime.datetime(9999, 12, 31, 23, 59, 59, 999999) + tick, 'date value out of range'),
     (lambda: tick + datetime.datetime(9999, 12, 31, 23, 59, 59, 999999), 'date value out of range'),
     (lambda: datetime.datetime(1, 1, 1) - tick, 'date value out of range'),
+    (lambda: datetime.datetime(2020, 1, 1) - datetime.timedelta.max, 'date value out of range'),
     (lambda: datetime.datetime(9999, 12, 31, 23, tzinfo=datetime.timezone.utc) + day, 'date value out of range'),
     (lambda: datetime.timedelta.max + tick, 'days=1000000000; must have magnitude <= 999999999'),
     (lambda: datetime.timedelta.min - tick, 'days=-1000000000; must have magnitude <= 999999999'),
