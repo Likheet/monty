@@ -33,17 +33,45 @@ assert sum([1e100, 1.0, -1e100], True) == 0.0
 assert sum([2**63, -(2**63), 0.1, 0.2, 0.3]) == 0.6000000000000001
 # and a float total is rounded when a complex item turns it complex, dropping its compensation
 assert sum([0.1, 0.2, 1j, 0.3]) == 0.6000000000000001 + 1j
-# items that can't join a float or complex total fail as they would with `+`
-try:
-    sum([0.5, 10**400])
-    assert False, 'expected OverflowError'
-except OverflowError as e:
-    assert str(e) == 'int too large to convert to float'
-try:
-    sum([1j, 'x'])
-    assert False, 'expected TypeError'
-except TypeError as e:
-    assert str(e) == "unsupported operand type(s) for +: 'complex' and 'str'"
+
+
+# items that can't join a total fail as they would with `+`, and so does the iterator
+class FailAfter:
+    def __init__(self, item):
+        self.items = [item]
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.items:
+            return self.items.pop()
+        raise ValueError('boom')
+
+
+for compute, message in [
+    (lambda: sum([0.5, 10**400]), 'OverflowError: int too large to convert to float'),
+    (lambda: sum([1j, 10**400]), 'OverflowError: int too large to convert to float'),
+    (lambda: sum([1, 'x']), "TypeError: unsupported operand type(s) for +: 'int' and 'str'"),
+    (lambda: sum([0.5, 'x']), "TypeError: unsupported operand type(s) for +: 'float' and 'str'"),
+    (lambda: sum([1j, 'x']), "TypeError: unsupported operand type(s) for +: 'complex' and 'str'"),
+    (lambda: sum(FailAfter(0.5)), 'ValueError: boom'),
+    (lambda: sum(FailAfter(1j)), 'ValueError: boom'),
+]:
+    try:
+        compute()
+        assert False, f'expected {message}'
+    except (OverflowError, TypeError, ValueError) as e:
+        assert f'{type(e).__name__}: {e}' == message
+
+
+# an item that `+` can still take ends the fast loop without an error
+class Tally:
+    def __radd__(self, other):
+        return 'tally'
+
+
+assert sum([1j, Tally()]) == 'tally'
 
 # str/bytes start values are rejected, pointing at join() instead
 try:
