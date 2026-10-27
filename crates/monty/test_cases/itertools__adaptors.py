@@ -197,6 +197,10 @@ for args, message in [
     except ValueError as exc:
         assert str(exc) == message
 
+# A bool bound is the int it equals
+assert list(itertools.islice([1, 2, 3], True)) == [1]
+assert list(itertools.islice([1, 2, 3], True, None, True)) == [2, 3]
+
 # === chain ===
 assert list(itertools.chain([1, 2], [3], [4, 5])) == [1, 2, 3, 4, 5]
 assert list(itertools.chain()) == []
