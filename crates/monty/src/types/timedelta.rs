@@ -15,7 +15,7 @@ use chrono::TimeDelta as ChronoTimeDelta;
 use smallvec::smallvec;
 
 use crate::{
-    args::{ArgValues, FromArgs, FromValue, FromValueFail, is_long_int},
+    args::{ArgValues, FromArgs, FromValue, FromValueFail, is_long_int, long_int},
     bytecode::{CallResult, VM},
     exception_private::{ExcType, ExcTypeExt, RunError, RunResult, SimpleException},
     hash::HashValue,
@@ -469,15 +469,18 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, TimeDelta> {
     }
 
     fn py_mul_impl(&self, other: &Value, vm: &mut VM<'h>) -> RunResult<Option<Value>> {
-        let multiplier = match other {
-            Value::Int(value) => i128::from(*value),
-            Value::Bool(value) => i128::from(*value),
-            _ => return Ok(None),
+        let total = total_microseconds(self.get(vm.heap));
+        let product = match other {
+            Value::Int(value) => total.checked_mul(i128::from(*value)),
+            Value::Bool(value) => total.checked_mul(i128::from(*value)),
+            _ => match long_int(other, vm) {
+                // Multiply exactly: `timedelta(microseconds=1) * 2**63` is still in range
+                Some(multiplier) => i128::try_from(multiplier * total).ok(),
+                None => return Ok(None),
+            },
         };
         // A product past `i128` has a day count far past the C int range.
-        let total = total_microseconds(self.get(vm.heap))
-            .checked_mul(multiplier)
-            .ok_or_else(ExcType::overflow_c_int)?;
+        let total = product.ok_or_else(ExcType::overflow_c_int)?;
         let result = from_total_microseconds(total)?;
         Ok(Some(Value::Ref(vm.heap.allocate(HeapData::TimeDelta(result)))))
     }
