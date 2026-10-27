@@ -803,7 +803,7 @@ fn bytes_find<'h>(bytes: &impl HeapView<'h, [u8]>, args: ArgValues, vm: &mut VM<
     let len = bytes.get(vm.heap).len();
     let (sub, range) = parse_bytes_sub_args("bytes.find", len, args, vm)?;
     let Some((start, end)) = range else {
-        // A `start` past `end` finds nothing, not even `b''`: `b'abc'.find(b'', 4)` is -1
+        // `start` past `end` finds nothing: `b'abc'.find(b'', 4) == -1`
         return Ok(Value::Int(-1));
     };
 
@@ -829,7 +829,7 @@ fn bytes_index<'h>(bytes: &impl HeapView<'h, [u8]>, args: ArgValues, vm: &mut VM
     let len = bytes.get(vm.heap).len();
     let (sub, range) = parse_bytes_sub_args("bytes.index", len, args, vm)?;
     let Some((start, end)) = range else {
-        // A `start` past `end` finds nothing, not even `b''`, so `index` raises where `find` gives -1
+        // `start` past `end` finds nothing: `b'abc'.index(b'', 4)` raises `ValueError`
         return Err(ExcType::value_error_subsequence_not_found());
     };
 
@@ -859,8 +859,7 @@ fn bytes_startswith<'h>(bytes: &impl HeapView<'h, [u8]>, args: ArgValues, vm: &m
     let len = bytes.get(vm.heap).len();
     let (prefix_arg, range) = parse_bytes_prefix_suffix_args("bytes.startswith", len, args, vm)?;
     let Some((start, end)) = range else {
-        // A `start` past `end` matches no prefix, not even `b''` (the argument parser has
-        // already rejected a prefix that is not bytes, as CPython does)
+        // `start` past `end` matches nothing: `b'abc'.startswith(b'', 4) == False`
         return Ok(Value::Bool(false));
     };
 
@@ -881,8 +880,7 @@ fn bytes_endswith<'h>(bytes: &impl HeapView<'h, [u8]>, args: ArgValues, vm: &mut
     let len = bytes.get(vm.heap).len();
     let (suffix_arg, range) = parse_bytes_prefix_suffix_args("bytes.endswith", len, args, vm)?;
     let Some((start, end)) = range else {
-        // A `start` past `end` matches no suffix, not even `b''` (the argument parser has
-        // already rejected a suffix that is not bytes, as CPython does)
+        // `start` past `end` matches nothing: `b'abc'.endswith(b'', 4) == False`
         return Ok(Value::Bool(false));
     };
 
@@ -1220,7 +1218,7 @@ fn bytes_rfind<'h>(bytes: &impl HeapView<'h, [u8]>, args: ArgValues, vm: &mut VM
     let len = bytes.get(vm.heap).len();
     let (sub, range) = parse_bytes_sub_args("bytes.rfind", len, args, vm)?;
     let Some((start, end)) = range else {
-        // A `start` past `end` finds nothing, not even `b''`: `b'abc'.rfind(b'', 4)` is -1
+        // `start` past `end` finds nothing: `b'abc'.rfind(b'', 4) == -1`
         return Ok(Value::Int(-1));
     };
 
@@ -1246,7 +1244,7 @@ fn bytes_rindex<'h>(bytes: &impl HeapView<'h, [u8]>, args: ArgValues, vm: &mut V
     let len = bytes.get(vm.heap).len();
     let (sub, range) = parse_bytes_sub_args("bytes.rindex", len, args, vm)?;
     let Some((start, end)) = range else {
-        // A `start` past `end` finds nothing, not even `b''`, so `rindex` raises where `rfind` gives -1
+        // `start` past `end` finds nothing: `b'abc'.rindex(b'', 4)` raises `ValueError`
         return Err(ExcType::value_error_subsequence_not_found());
     };
 
