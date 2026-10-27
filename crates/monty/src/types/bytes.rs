@@ -780,7 +780,7 @@ fn bytes_count<'h>(bytes: &impl HeapView<'h, [u8]>, args: ArgValues, vm: &mut VM
     let len = bytes.get(vm.heap).len();
     let (sub, range) = parse_bytes_sub_args("bytes.count", len, args, vm)?;
     let Some((start, end)) = range else {
-        // A `start` past `end` counts nothing, not even `b''`: `b'abc'.count(b'', 2, 1)` is 0
+        // `start` past `end` counts nothing: `b'abc'.count(b'', 2, 1) == 0`
         return Ok(Value::Int(0));
     };
 
