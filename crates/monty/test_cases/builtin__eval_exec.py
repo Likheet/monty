@@ -166,6 +166,14 @@ for source, message in [
         'def f():\n    return [x for x in y if await g()]',
         'asynchronous comprehension outside of an asynchronous function (<string>, line 2)',
     ),
+    (
+        'def f():\n    return {await g() for x in y}',
+        'asynchronous comprehension outside of an asynchronous function (<string>, line 2)',
+    ),
+    (
+        'def f():\n    return [x for x in y for z in [await g()]]',
+        'asynchronous comprehension outside of an asynchronous function (<string>, line 2)',
+    ),
 ]:
     try:
         exec(source)
