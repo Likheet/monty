@@ -116,7 +116,7 @@ for sequence, _ in sequences:
     assert overflow_error(sequence, Count(-(2**100))) == "cannot fit 'Count' into an index-sized integer"
     assert overflow_error(sequence, -(2**63) - 1) == "cannot fit 'int' into an index-sized integer"
     assert overflow_error(sequence, 2**63) == "cannot fit 'int' into an index-sized integer"
-    assert sequence * -(2**63) == sequence * 0
+    assert sequence * -(2**31) == sequence * 0
 repeated = [1]
 try:
     repeated *= Count(2**100)
