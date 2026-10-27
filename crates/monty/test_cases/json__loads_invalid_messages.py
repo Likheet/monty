@@ -107,9 +107,13 @@ invalid_cases = [
     ('-01', 'Extra data: line 1 column 3 (char 2)'),
     ('1.', 'Extra data: line 1 column 2 (char 1)'),
     ('1e+', 'Extra data: line 1 column 2 (char 1)'),
+    ('1.5x', 'Extra data: line 1 column 4 (char 3)'),
+    ('-0.25E+3y', 'Extra data: line 1 column 9 (char 8)'),
     ('[1.e5]', "Expecting ',' delimiter: line 1 column 3 (char 2)"),
     ('{"a": 01}', "Expecting ',' delimiter: line 1 column 8 (char 7)"),
     ('["]", 01]', "Expecting ',' delimiter: line 1 column 8 (char 7)"),
+    ('["a\\"b", 1x]', "Expecting ',' delimiter: line 1 column 11 (char 10)"),
+    ('[[1], 2x]', "Expecting ',' delimiter: line 1 column 8 (char 7)"),
     # a raw control character in a string
     ('"\t"', 'Invalid control character at: line 1 column 2 (char 1)'),
     ('{"a\x01": 1}', 'Invalid control character at: line 1 column 4 (char 3)'),
