@@ -1817,10 +1817,8 @@ pub(crate) fn qualified_type_name(value: &Value, vm: &VM<'_>) -> String {
 /// The failed hash reports only that some element is unhashable, so this walks
 /// the elements again and names the innermost one, as CPython's error does.
 pub(crate) fn unhashable_type_name(value: &Value, vm: &mut VM<'_>) -> RunResult<String> {
-    match first_unhashable_element(value, vm)? {
-        Some(name) => Ok(name),
-        None => Ok(value.py_type_name(vm).into_owned()),
-    }
+    let name = first_unhashable_element(value, vm)?;
+    Ok(name.unwrap_or_else(|| value.py_type_name(vm).into_owned()))
 }
 
 /// The type name of the innermost unhashable element of `value`, or `None` when

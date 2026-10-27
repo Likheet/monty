@@ -24,7 +24,7 @@ use crate::{
     types::{
         Dict, LazyHeapSet, NamedTuple, PyTrait, Type,
         hash_table::{PyHashTable, Slot, TableEntry, TableProbe, TableSource},
-        set::{qualified_type_name, unhashable_type_name},
+        set::unhashable_type_name,
         tuple::{TupleVec, allocate_tuple},
     },
     value::{EitherStr, Value},
@@ -234,15 +234,11 @@ struct StoreArgs {
 }
 
 /// Hashes a cache key before entering the mutation-aware table probe.
+///
+/// `make_key` has already raised for an unhashable key, so this one hashes.
 fn key_hash(key: &Value, vm: &mut VM<'_>) -> RunResult<u64> {
-    if let Some(hash) = key.py_hash(vm)? {
-        return Ok(hash.raw());
-    }
-    let unhashable_type = unhashable_type_name(key, vm)?;
-    Err(ExcType::type_error_unhashable_dict_key(
-        &qualified_type_name(key, vm),
-        &unhashable_type,
-    ))
+    let hash = key.py_hash(vm)?.expect("make_key rejects unhashable keys");
+    Ok(hash.raw())
 }
 
 /// Stores a successful frozen call's result. Consumes the key; borrows the wrapper and value.
