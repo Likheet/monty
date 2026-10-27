@@ -1834,6 +1834,9 @@ fn first_unhashable_element(value: &Value, vm: &mut VM<'_>) -> RunResult<Option<
         return Ok(None);
     };
     let len = match vm.heap.get(*id) {
+        // Skip tuples that already hashed, so the walk stays linear like the hash
+        HeapData::Tuple(tuple) if tuple.has_cached_hash() => return Ok(None),
+        HeapData::NamedTuple(namedtuple) if namedtuple.has_cached_hash() => return Ok(None),
         HeapData::Tuple(tuple) => tuple.as_slice().len(),
         HeapData::NamedTuple(namedtuple) => namedtuple.as_vec().len(),
         HeapData::Instance(instance)

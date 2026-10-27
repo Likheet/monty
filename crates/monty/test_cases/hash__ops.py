@@ -219,3 +219,14 @@ for compute, expected, calls in [
     except TypeError as e:
         assert str(e) == expected
     assert len(hash_calls) == calls
+
+
+# The walk skips subtrees that already hashed, so it is as fast as the hash.
+shared = ()
+for _ in range(40):
+    shared = (shared, shared)
+try:
+    hash((Pair(shared, shared), shared, []))
+    assert False, 'expected TypeError'
+except TypeError as e:
+    assert str(e) == "unhashable type: 'list'"
