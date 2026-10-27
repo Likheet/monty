@@ -185,17 +185,15 @@ pub(crate) fn search_range(
     vm: &mut VM<'_>,
 ) -> RunResult<SearchRange> {
     let start = match start {
-        Some(value) => value_to_option_i64(value, vm)?,
-        None => None,
+        Some(value) => match value_to_option_i64(value, vm)?.unwrap_or(0) {
+            index if index < 0 => normalize_sequence_index(index, len),
+            index => usize::try_from(index).unwrap_or(usize::MAX),
+        },
+        None => 0,
     };
     let end = match end {
         Some(value) => optional_sequence_bound(value, len, len, vm)?,
         None => len,
-    };
-    let start = match start {
-        Some(index) if index > 0 => usize::try_from(index).unwrap_or(usize::MAX),
-        Some(index) => normalize_sequence_index(index, len),
-        None => 0,
     };
     Ok((start <= end).then_some((start, end)))
 }

@@ -254,6 +254,18 @@ try:
     assert False, 'expected TypeError'
 except TypeError as e:
     assert str(e) == 'tuple for endswith must only contain str, not int'
+# A bad start or end raises before anything is searched
+for search in (
+    lambda: 'hello'.rfind('l', 'x'),
+    lambda: 'hello'.index('l', None, 'x'),
+    lambda: 'hello'.rindex('l', 0, 'x'),
+    lambda: 'hello'.count('l', 'x'),
+):
+    try:
+        search()
+        assert False, 'expected TypeError'
+    except TypeError as e:
+        assert str(e) == 'slice indices must be integers or None or have an __index__ method'
 
 # === Phase 4: Strip/trim methods ===
 

@@ -919,6 +919,7 @@ fn str_find<'h>(s: &impl HeapView<'h, str>, args: ArgValues, vm: &mut VM<'h>) ->
     let str_len = s.get(vm.heap).chars().count();
     let (sub, range) = parse_search_args("str.find", str_len, args, vm)?;
     let Some((start, end)) = range else {
+        // A `start` past `end` finds nothing, not even '': `'abc'.find('', 4)` is -1
         return Ok(Value::Int(-1));
     };
     let s = s.get(vm.heap);
@@ -942,6 +943,7 @@ fn str_rfind<'h>(s: &impl HeapView<'h, str>, args: ArgValues, vm: &mut VM<'h>) -
     let str_len = s.get(vm.heap).chars().count();
     let (sub, range) = parse_search_args("str.rfind", str_len, args, vm)?;
     let Some((start, end)) = range else {
+        // A `start` past `end` finds nothing, not even '': `'abc'.rfind('', 4)` is -1
         return Ok(Value::Int(-1));
     };
     let s = s.get(vm.heap);
@@ -964,6 +966,7 @@ fn str_index<'h>(s: &impl HeapView<'h, str>, args: ArgValues, vm: &mut VM<'h>) -
     let str_len = s.get(vm.heap).chars().count();
     let (sub, range) = parse_search_args("str.index", str_len, args, vm)?;
     let Some((start, end)) = range else {
+        // A `start` past `end` finds nothing, not even '', so `index` raises where `find` gives -1
         return Err(ExcType::value_error_substring_not_found());
     };
     let s = s.get(vm.heap);
@@ -985,6 +988,7 @@ fn str_rindex<'h>(s: &impl HeapView<'h, str>, args: ArgValues, vm: &mut VM<'h>) 
     let str_len = s.get(vm.heap).chars().count();
     let (sub, range) = parse_search_args("str.rindex", str_len, args, vm)?;
     let Some((start, end)) = range else {
+        // A `start` past `end` finds nothing, not even '', so `rindex` raises where `rfind` gives -1
         return Err(ExcType::value_error_substring_not_found());
     };
     let s = s.get(vm.heap);
@@ -1007,6 +1011,7 @@ fn str_count<'h>(s: &impl HeapView<'h, str>, args: ArgValues, vm: &mut VM<'h>) -
     let str_len = s.get(vm.heap).chars().count();
     let (sub, range) = parse_search_args("str.count", str_len, args, vm)?;
     let Some((start, end)) = range else {
+        // A `start` past `end` counts nothing, not even '': `'abc'.count('', 2, 1)` is 0
         return Ok(Value::Int(0));
     };
     let s = s.get(vm.heap);

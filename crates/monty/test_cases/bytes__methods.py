@@ -396,6 +396,19 @@ for search in (lambda: b'hello'.index(b'', 10), lambda: b'hello'.rindex(b'', 3, 
     except ValueError as e:
         assert str(e) == 'subsection not found'
 
+# A bad start or end raises before anything is searched
+for search in (
+    lambda: b'hello'.count(b'l', 'x'),
+    lambda: b'hello'.index(b'l', None, 'x'),
+    lambda: b'hello'.rfind(b'l', 'x'),
+    lambda: b'hello'.rindex(b'l', 0, 'x'),
+):
+    try:
+        search()
+        assert False, 'expected TypeError'
+    except TypeError as e:
+        assert str(e) == 'slice indices must be integers or None or have an __index__ method'
+
 # === bytes.hex() non-ASCII separator errors ===
 try:
     b'\x01\x02'.hex('\xff')
