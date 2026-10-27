@@ -17,6 +17,7 @@ assert re.sub('', lambda m: '_', '') == '_'
 # no match calls nothing, and a negative count changes nothing
 assert re.sub('z', lambda m: 5, 'abc') == 'abc'
 assert re.sub('a', lambda m: 5, 'abc', count=-1) == 'abc'
+assert re.compile('a').sub(lambda m: 5, 'abc', count=-1) == 'abc'
 # a None result adds nothing
 assert re.sub('a', lambda m: None, 'banana') == 'bnn'
 
@@ -61,6 +62,13 @@ try:
     assert False, 'expected KeyError'
 except KeyError as e:
     assert e.args == ('boom',)
+
+# the subject must still be a string
+try:
+    re.sub('a', lambda m: 'x', 5)
+    assert False, 'expected TypeError'
+except TypeError as e:
+    assert str(e) == "expected string or bytes-like object, got 'int'"
 
 # the function gets the match as its one argument
 try:
