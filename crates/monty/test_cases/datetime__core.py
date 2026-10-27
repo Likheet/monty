@@ -1189,6 +1189,7 @@ for call, message in [
     (lambda: datetime.timedelta.max * 2**62, 'Python int too large to convert to C int'),
     (lambda: datetime.timedelta.max * 2**63, 'Python int too large to convert to C int'),
     (lambda: 2**63 * datetime.timedelta.max, 'Python int too large to convert to C int'),
+    (lambda: datetime.timedelta(microseconds=1) * 2**130, 'Python int too large to convert to C int'),
 ]:
     try:
         call()
@@ -1200,6 +1201,7 @@ assert datetime.timedelta(microseconds=1) * 2**63 == datetime.timedelta(
     days=106751991, seconds=14454, microseconds=775808
 )
 assert 2**70 * datetime.timedelta(0) == datetime.timedelta(0)
+assert 2**130 * datetime.timedelta(0) == datetime.timedelta(0)
 
 # === FromArgs migration: invalid argument-type coverage ===
 # Monty's int extraction reports CPython's `'<type>' object cannot be

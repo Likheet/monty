@@ -473,9 +473,11 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, TimeDelta> {
         let product = match other {
             Value::Int(value) => total.checked_mul(i128::from(*value)),
             Value::Bool(value) => total.checked_mul(i128::from(*value)),
-            _ => match long_int(other, vm) {
-                // Multiply exactly: `timedelta(microseconds=1) * 2**63` is still in range
-                Some(multiplier) => i128::try_from(multiplier * total).ok(),
+            // `timedelta(microseconds=1) * 2**63` is still in range. A multiplier past
+            // `i128` overflows unless the duration is zero, so no big product is built.
+            _ => match long_int(other, vm).map(i128::try_from) {
+                Some(Ok(multiplier)) => total.checked_mul(multiplier),
+                Some(Err(_)) => (total == 0).then_some(0),
                 None => return Ok(None),
             },
         };
