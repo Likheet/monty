@@ -330,6 +330,19 @@ try:
 except TypeError as e:
     assert str(e) == "'float' object cannot be interpreted as an integer"
 
+
+# An error from the start's `__index__` propagates.
+class RaisingIndex:
+    def __index__(self):
+        raise ValueError('no index')
+
+
+try:
+    enumerate('a', RaisingIndex())
+    assert False, 'expected ValueError'
+except ValueError as e:
+    assert str(e) == 'no index'
+
 # a non-iterable errors out of iterator construction without leaking a
 # heap-backed start=
 try:
