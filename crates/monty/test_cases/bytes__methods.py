@@ -278,19 +278,21 @@ assert b'a\r\tb'.expandtabs(2) == b'a\r  b'
 assert b'\t\t'.expandtabs(3) == b'      '
 assert b'\t'.expandtabs(0) == b''
 assert b'\t'.expandtabs(-1) == b''
+assert b'a\tb\t'.expandtabs(0) == b'ab'
+assert b'a\tb\t'.expandtabs(-1) == b'ab'
 assert b''.expandtabs() == b''
 # Each byte is one column, even inside a multi-byte UTF-8 sequence.
 assert b'\xc3\xa9\tx'.expandtabs(4) == b'\xc3\xa9  x'
-for compute, error in [
-    (lambda: b''.expandtabs(1.5), "'float' object cannot be interpreted as an integer"),
-    (lambda: b''.expandtabs(2**31), 'Python int too large to convert to C int'),
-    (lambda: b''.expandtabs(1, 2), 'expandtabs() takes at most 1 argument (2 given)'),
-    (lambda: b''.expandtabs(size=1), "expandtabs() got an unexpected keyword argument 'size'"),
+for compute, exc_type, error in [
+    (lambda: b''.expandtabs(1.5), TypeError, "'float' object cannot be interpreted as an integer"),
+    (lambda: b''.expandtabs(2**31), OverflowError, 'Python int too large to convert to C int'),
+    (lambda: b''.expandtabs(1, 2), TypeError, 'expandtabs() takes at most 1 argument (2 given)'),
+    (lambda: b''.expandtabs(size=1), TypeError, "expandtabs() got an unexpected keyword argument 'size'"),
 ]:
     try:
         compute()
         assert False, 'expandtabs with a bad argument should raise'
-    except (TypeError, OverflowError) as e:
+    except exc_type as e:
         assert str(e) == error
 
 # === bytes.join() ===

@@ -2083,7 +2083,13 @@ fn bytes_expandtabs<'h>(bytes: &impl HeapView<'h, [u8]>, args: ArgValues, vm: &m
     let tabsize = parse_expandtabs_tabsize(args, vm)?;
 
     let bytes = bytes.get(vm.heap);
-    let mut builder = BytesBuilder::with_capacity(bytes.len(), &vm.heap.tracker)?;
+    // A `tabsize` of zero or less drops the tabs, so `(b'\t' * n).expandtabs(0)` reserves nothing
+    let kept = if tabsize > 0 {
+        bytes.len()
+    } else {
+        bytes.iter().filter(|&&byte| byte != b'\t').count()
+    };
+    let mut builder = BytesBuilder::with_capacity(kept, &vm.heap.tracker)?;
     let mut column = 0;
     for (i, &byte) in bytes.iter().enumerate() {
         // `push_repeated` polls the clock per chunk of one tab only, so many large
