@@ -1205,7 +1205,15 @@ impl<'h> HeapRead<'h, Dict> {
             .tracker
             .check_allocation(pairs.len().saturating_mul(VALUE_SIZE + mem::size_of::<usize>()))?;
         let counts = pairs.iter().map(|(_, value)| value.clone_with_heap(vm.heap)).collect();
-        let order = counter_order(counts, vm)?;
+        // CPython's `Counter.__repr__` falls back to insertion order when the counts
+        // cannot be ordered: it catches the `TypeError` from `most_common()`.
+        let order = match counter_order(counts, vm) {
+            Ok(order) => order,
+            Err(RunError::Exc(raise)) if raise.exc.exc_type().is_subclass_of(ExcType::TypeError) => {
+                (0..pairs.len()).collect()
+            }
+            Err(err) => return Err(err),
+        };
         f.write_char('{')?;
         for (n, &i) in order.iter().enumerate() {
             if n > 0 {
