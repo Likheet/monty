@@ -91,7 +91,9 @@ pub(crate) fn type_of_ref(vm: &mut VM<'_>, value: &Value) -> Value {
     } else {
         match value.py_type(vm) {
             Type::Exception(exc_type) => Value::Builtin(Builtins::ExcType(exc_type)),
-            other => Value::Builtin(Builtins::Type(other)),
+            other => Value::Builtin(Builtins::Type(
+                other.try_into().expect("instances return their class object"),
+            )),
         }
     }
 }
