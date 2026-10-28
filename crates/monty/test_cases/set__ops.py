@@ -266,6 +266,22 @@ s.difference_update(s)
 assert s == set()
 
 
+# An `__iter__` that raises leaves the set unchanged
+class RaisingIter:
+    def __iter__(self):
+        raise ValueError('iter')
+
+
+s = {1, 2}
+for update in [lambda: s.update(RaisingIter()), lambda: s.difference_update(RaisingIter())]:
+    try:
+        update()
+        assert False, 'expected ValueError'
+    except ValueError as e:
+        assert str(e) == 'iter'
+assert s == {1, 2}
+
+
 # An `__eq__` that raises on a hash collision propagates from every in-place form
 class RaisingEq:
     def __hash__(self):
