@@ -582,7 +582,8 @@ class AbstractOS(ABC):
         estimated at four bytes per character for both absolute and relative paths.
 
         The default walks the tree with `path_iterdir()`, `path_is_dir()`, `path_is_file()` and
-        `path_is_symlink()`; override it to answer in fewer host calls.
+        `path_is_symlink()`; override it to answer in fewer host calls. When neither the root
+        nor a symlink exists, `path_stat()` surfaces the underlying lookup error.
 
         Args:
             path: The directory to scan; may also name a file, which is described but not listed.
@@ -594,9 +595,12 @@ class AbstractOS(ABC):
 
         Raises:
             FileNotFoundError: If `path` does not exist.
+            NotADirectoryError: If a parent of `path` is not a directory.
             RuntimeError: If the default scan exceeds its entry or path-data limit.
         """
         if not (self.path_exists(path) or self.path_is_symlink(path)):
+            # Surface lookup errors (e.g. an intermediate file) hidden by the predicates.
+            self.path_stat(path)
             raise FileNotFoundError(f'[Errno 2] No such file or directory: {str(path)!r}')
         root = self._scan_entry('', path)
         entries = [root]
@@ -1114,13 +1118,13 @@ class OSAccess(AbstractOS):
         return f'OSAccess(files={self.files}, environ={self.environ})'
 
     def path_exists(self, path: PurePosixPath) -> bool:
-        return self._get_entry(path) is not None
+        return self._get_entry(path, strict=False) is not None
 
     def path_is_file(self, path: PurePosixPath) -> bool:
-        return _is_file(self._get_entry(path))
+        return _is_file(self._get_entry(path, strict=False))
 
     def path_is_dir(self, path: PurePosixPath) -> bool:
-        return _is_dir(self._get_entry(path))
+        return _is_dir(self._get_entry(path, strict=False))
 
     def path_is_symlink(self, path: PurePosixPath) -> bool:
         return False
@@ -1313,10 +1317,10 @@ class OSAccess(AbstractOS):
         parent_dir = self._parent_entry(path)
         assert _is_dir(parent_dir), f'Expected parent of a file to always be a directory, got {parent_dir}'
 
+        target_entry = self._get_entry(target)
         target_parent = self._parent_entry(target)
         if not _is_dir(target_parent):
             raise FileNotFoundError(f'[Errno 2] No such file or directory: {str(path)!r} -> {str(target)!r}')
-        target_entry = self._get_entry(target)
 
         if _is_file(src_entry):
             if _is_dir(target_entry):
@@ -1367,7 +1371,12 @@ class OSAccess(AbstractOS):
     def get_environ(self) -> dict[str, str]:
         return self.environ
 
-    def _get_entry(self, path: PurePosixPath) -> Tree | AbstractFile | None:
+    def _get_entry(self, path: PurePosixPath, *, strict: bool = True) -> Tree | AbstractFile | None:
+        """Look up a file or directory, returning `None` if a component is missing.
+
+        If an intermediate component is a file, raise `NotADirectoryError` in strict
+        mode; otherwise return `None` so existence/type predicates report `False`.
+        """
         dir = self._tree
 
         *dir_parts, name = PurePosixPath(path).parts
@@ -1376,6 +1385,8 @@ class OSAccess(AbstractOS):
             entry = dir.get(part)
             if _is_dir(entry):
                 dir = entry
+            elif strict and _is_file(entry):
+                raise NotADirectoryError(f'[Errno 20] Not a directory: {str(path)!r}')
             else:
                 return None
 
