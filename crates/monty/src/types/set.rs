@@ -878,7 +878,7 @@ impl<'h> HeapReadMut<'h, Set> {
         Ok(true)
     }
 
-    /// Updates from a snapshotted set or an arbitrary iterable.
+    /// Updates from a snapshotted set, or from any other iterable item by item.
     fn hr_update(&self, other: Value, vm: &mut VM<'h>) -> RunResult<()> {
         // Try direct extraction from Set/FrozenSet
         let entries_opt = {
@@ -897,9 +897,37 @@ impl<'h> HeapReadMut<'h, Set> {
             return self.extend_from_entries(entries, vm);
         }
 
-        // Fall back to iterable
-        let mut temp_set = Set::from_iterable(other, vm)?;
-        self.extend_from_entries(temp_set.0.table.take_entries(), vm)
+        self.for_each_item(other, vm, |set, item, vm| set.add(item, vm).map(drop))
+    }
+
+    /// `difference_update` with one operand. A set is snapshotted first, which
+    /// covers `s.difference_update(s)`; any other iterable is removed item by item.
+    fn difference_update(&self, other: Value, vm: &mut VM<'h>) -> RunResult<()> {
+        if is_any_set(&other, vm) {
+            return self.algebra_update(other, SetAlgebra::Difference, vm);
+        }
+        self.for_each_item(other, vm, |set, item, vm| {
+            defer_drop!(item, vm);
+            set.discard(item, vm)
+        })
+    }
+
+    /// Applies `apply` to each item of `iterable` as it is yielded, as CPython's
+    /// `update` and `difference_update` do: an iterator that raises part way
+    /// keeps the items before the error.
+    fn for_each_item(
+        &self,
+        iterable: Value,
+        vm: &mut VM<'h>,
+        mut apply: impl FnMut(&Self, Value, &mut VM<'h>) -> RunResult<()>,
+    ) -> RunResult<()> {
+        let iterator = iterable.into_py_iter(vm)?.require_synchronous(vm)?;
+        defer_drop!(iterator, vm);
+        let mut iterator = iterator.read(vm);
+        while let Some(item) = iterator.py_next(vm)? {
+            apply(self, item, vm)?;
+        }
+        Ok(())
     }
 
     /// The in-place form of a set operation: `op` with `other` (any iterable)
@@ -917,10 +945,10 @@ impl<'h> HeapReadMut<'h, Set> {
         previous.drop_with(vm);
     }
 
-    /// Applies `algebra_update` with each operand in turn, as `difference_update`
-    /// does in CPython: an error part way keeps the operands applied so far, and
-    /// the operands it does not reach are released.
-    fn algebra_update_each(&self, others: ArgPosIter, op: SetAlgebra, vm: &mut VM<'h>) -> RunResult<()> {
+    /// Applies `difference_update` with each operand in turn, as CPython does: an
+    /// error part way keeps the operands applied so far, and the operands it does
+    /// not reach are released.
+    fn difference_update_each(&self, others: ArgPosIter, vm: &mut VM<'h>) -> RunResult<()> {
         defer_drop_mut!(others, vm);
         loop {
             // As in `update`: poll the clock before each operand's pass.
@@ -928,7 +956,7 @@ impl<'h> HeapReadMut<'h, Set> {
             let Some(other) = others.next() else {
                 return Ok(());
             };
-            self.algebra_update(other, op, vm)?;
+            self.difference_update(other, vm)?;
         }
     }
 
@@ -1275,8 +1303,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Set> {
         if !is_any_set(other, vm) {
             return Ok(false);
         }
-        let mut other_storage = get_storage_from_set_operand(other, vm)?.expect("a set operand has storage");
-        self.extend_from_entries(other_storage.table.take_entries(), vm)?;
+        self.hr_update(other.clone_with_heap(vm), vm)?;
         Ok(true)
     }
 
@@ -1366,7 +1393,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Set> {
             }
             Some(StaticStrings::DifferenceUpdate) => {
                 let others = args.into_pos_only("set.difference_update", vm.heap)?;
-                self.algebra_update_each(others, SetAlgebra::Difference, vm)?;
+                self.difference_update_each(others, vm)?;
                 Ok(Value::None)
             }
             Some(StaticStrings::SymmetricDifferenceUpdate) => {
@@ -1727,17 +1754,17 @@ impl HeapItem for FrozenSet {
     }
 }
 
-/// Returns temporary set storage only for operator-valid set operands.
-///
-/// This is stricter than `Set::get_storage_from_value(...)`: operator forms
-/// only accept CPython's set-like operands (`set`, `frozenset`, `dict_keys`,
-/// and `dict_items`), while method forms accept any iterable.
 /// Whether `value` is a `set` or `frozenset`, the only operands CPython's in-place
 /// set operators (`set_ior` and its siblings) take.
 fn is_any_set(value: &Value, vm: &VM<'_>) -> bool {
     matches!(value, Value::Ref(id) if matches!(vm.heap.get(*id), HeapData::Set(_) | HeapData::FrozenSet(_)))
 }
 
+/// Returns temporary set storage only for operator-valid set operands.
+///
+/// This is stricter than `Set::get_storage_from_value(...)`: operator forms
+/// only accept CPython's set-like operands (`set`, `frozenset`, `dict_keys`,
+/// and `dict_items`), while method forms accept any iterable.
 fn get_storage_from_set_operand(value: &Value, vm: &mut VM<'_>) -> RunResult<Option<SetStorage>> {
     let Value::Ref(id) = value else {
         return Ok(None);

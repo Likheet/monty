@@ -232,6 +232,72 @@ except TypeError:
     pass
 assert s == {2, 3}
 
+
+# update and difference_update apply each item as it arrives, so an iterator that
+# raises part way keeps the items before the error.
+class RaiseAtZero:
+    def __init__(self, items):
+        self.items = list(items)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        item = self.items.pop(0)
+        if item == 0:
+            raise ValueError('stop')
+        return item
+
+
+s = {1, 2, 3}
+try:
+    s.update(RaiseAtZero([4, 5, 0]))
+    assert False, 'expected ValueError'
+except ValueError:
+    pass
+assert s == {1, 2, 3, 4, 5}
+try:
+    s.difference_update(RaiseAtZero([1, 2, 0]))
+    assert False, 'expected ValueError'
+except ValueError:
+    pass
+assert s == {3, 4, 5}
+s.difference_update(s)
+assert s == set()
+
+
+# An `__eq__` that raises on a hash collision propagates from every in-place form
+class RaisingEq:
+    def __hash__(self):
+        return 1
+
+    def __eq__(self, other):
+        raise ValueError('eq')
+
+
+def ior(s, t):
+    s |= t
+
+
+def iand(s, t):
+    s &= t
+
+
+def isub(s, t):
+    s -= t
+
+
+def ixor(s, t):
+    s ^= t
+
+
+for update in [ior, iand, isub, ixor, lambda s, t: s.intersection_update(t)]:
+    try:
+        update({RaisingEq()}, {RaisingEq()})
+        assert False, 'expected ValueError'
+    except ValueError as e:
+        assert str(e) == 'eq'
+
 # === Issubset ===
 s1 = set([1, 2])
 s2 = set([1, 2, 3])
