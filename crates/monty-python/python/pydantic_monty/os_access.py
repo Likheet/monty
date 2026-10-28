@@ -5,6 +5,7 @@ import datetime
 import functools
 import inspect
 import os
+import stat
 import time
 from abc import ABC, abstractmethod
 from pathlib import PurePosixPath
@@ -94,10 +95,21 @@ class StatResult(NamedTuple):
             mtime: Modification time as Unix timestamp, defaults to Now.
         """
         # If only permission bits provided (no file type), add regular file type
-        if mode < 0o1000:
-            mode = mode | 0o100_000
+        if not stat.S_IFMT(mode):
+            mode |= stat.S_IFREG
         mtime = time.time() if mtime is None else mtime
-        return cls(mode, 0, 0, 1, 0, 0, size, mtime, mtime, mtime)
+        return cls(
+            st_mode=mode,
+            st_ino=0,
+            st_dev=0,
+            st_nlink=1,
+            st_uid=0,
+            st_gid=0,
+            st_size=size,
+            st_atime=mtime,
+            st_mtime=mtime,
+            st_ctime=mtime,
+        )
 
     @classmethod
     def dir_stat(cls, mode: int = 0o755, mtime: float | None = None) -> Self:
@@ -113,11 +125,22 @@ class StatResult(NamedTuple):
             A namedtuple with stat_result fields
         """
         # If only permission bits provided (no file type), add directory type
-        if mode < 0o1000:
-            mode = mode | 0o040_000
+        if not stat.S_IFMT(mode):
+            mode |= stat.S_IFDIR
 
         mtime = time.time() if mtime is None else mtime
-        return cls(mode, 0, 0, 2, 0, 0, 4096, mtime, mtime, mtime)
+        return cls(
+            st_mode=mode,
+            st_ino=0,
+            st_dev=0,
+            st_nlink=2,
+            st_uid=0,
+            st_gid=0,
+            st_size=4096,
+            st_atime=mtime,
+            st_mtime=mtime,
+            st_ctime=mtime,
+        )
 
     st_mode: int
     """protection bits"""
