@@ -30,7 +30,7 @@ use monty_types::{
 
 use crate::{
     args::{ArgValues, FromArgs, LaxBool},
-    bytecode::{CallResult, VM},
+    bytecode::{CallResult, PendingImport, VM},
     defer_drop,
     exception_private::{ExcTypeExt, RunError, RunResult, SimpleException},
     heap::{ContainsHeap, DropWithContext, Heap, HeapData, HeapId},
@@ -77,6 +77,8 @@ pub(crate) enum PendingEffect {
     /// Builds a walk, scandir or glob result from a `Path.scan` reply — or
     /// from the `OSError` it answered with (see [`ScanEffect::absorbs`]).
     Scan(ScanEffect),
+    /// Resolves an `import` call's answer: a module, a file to run, or a miss.
+    Import(PendingImport),
 }
 
 impl PendingEffect {
@@ -87,6 +89,7 @@ impl PendingEffect {
         match self {
             Self::Pre(effect) => Some(effect.operation_name()),
             Self::Scan(effect) => Some(effect.operation_name()),
+            Self::Import(_) => Some("import"),
             Self::Post(PostConversionEffect::OpenName { .. }) => Some("open"),
             // The parse answers the `json.load` call; a future would hand Python the text.
             Self::Post(PostConversionEffect::JsonLoad { .. }) => Some("json.load"),
@@ -116,7 +119,7 @@ impl PendingEffect {
     /// held across the host yield (see [`PostConversionEffect::release`]).
     pub(crate) fn release(self, heap: &mut impl ContainsHeap) {
         match self {
-            Self::Pre(_) => {}
+            Self::Pre(_) | Self::Import(_) => {}
             Self::Post(effect) => effect.release(heap),
             Self::Scan(effect) => effect.release(heap),
         }
