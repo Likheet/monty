@@ -2187,3 +2187,7 @@ mod tests {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/unit/format_template.rs"]
+mod format_template_tests;

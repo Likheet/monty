@@ -52,6 +52,15 @@ carry no API compatibility guarantee.
 - **[`monty`](../api/rust/monty.md)** is the in-process interpreter.
     Use it when you control the code being run, or when subprocesses are impossible.
 
+Execution limits use wall time by default. CPU mode, Linux only, uses sampled thread CPU time.
+The `monty` crate enables the `monty-types/cpu-clock` feature for native CPU reads.
+`ExecutionClock::is_available()` checks whether this thread can read the selected clock.
+Off Linux a CPU-mode `ResourceTracker` charges elapsed time instead, so check it before selecting CPU mode directly.
+CPU-mode [`PoolConfig::subprocess`](../api/rust/monty-pool.md#poolconfig) pools independently measure child process CPU.
+They require a finite `PoolConfig::request_timeout` as a wall deadline.
+Remote deployments enable CPU enforcement in the server's local subprocess pool; WebSocket clients adopt its clock.
+See [resource limits](../resource-limits.md#time) for platform support, sampling, fallback, and snapshot compatibility.
+
 A Monty process can never be made fully crash-proof against memory errors — a stack-overflow abort or an allocator abort
 takes the whole process down.
 That is the entire reason `monty-pool` exists: the crash kills a worker, the pool notices and replaces it, and your

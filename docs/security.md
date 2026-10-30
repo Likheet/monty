@@ -444,9 +444,10 @@ See [resource limits](resource-limits.md) for the full picture; the security-rel
     Neither accumulates across feeds — there is no session-lifetime budget, so bounding what a session costs in total is
     the host's job.
 - The in-sandbox time check only runs at interpreter checkpoints.
-    Host-side backstops cover a wedged worker: `request_timeout` (a per-turn deadline; a loop of quick host calls
-    resets it), and one grace per duration limit — `feed_duration_limit_grace` and `turn_duration_limit_grace` — each firing only if the
-    session also set the limit it backs.
+    Host-side backstops cover a wedged worker.
+    `request_timeout` sets a per-turn wall deadline, reset by each quick host call.
+    The optional `feed_duration_limit_grace` and `turn_duration_limit_grace` use the selected execution clock.
+    They apply only when the session sets the corresponding duration budget.
     Set `request_timeout` and at least one duration limit for untrusted code.
     `max_turn_duration_secs` does not close the gap named above: its clock also restarts at each host answer, so a loop
     of quick host calls resets it just as it resets `request_timeout`.
@@ -457,12 +458,18 @@ See [resource limits](resource-limits.md) for the full picture; the security-rel
     Every local pool ([`Monty`][pydantic_monty.Monty], [`AsyncMonty`][pydantic_monty.AsyncMonty], JavaScript `Monty.create()`, [`PoolConfig::subprocess`](api/rust/monty-pool.md#poolconfig)) defaults
     `request_timeout` to no deadline; only the WebSocket pools ([`AsyncMontyWebsocket`][pydantic_monty.AsyncMontyWebsocket],
     JavaScript `MontyWebsocket.create()`) set one, at 10 seconds.
+    Local Python, JavaScript and Rust subprocess pools support [CPU execution clocks](resource-limits.md#cpu-execution-clock)
+    on Linux only. Their graces use an independent process CPU counter.
+    CPU mode requires a finite wall deadline: `request_timeout` in Python, `requestTimeout` in JavaScript,
+    or `PoolConfig::request_timeout` in Rust.
+    WebSocket clients adopt the server's clock; only the server's local CPU-mode subprocess pool enforces CPU.
 - **After a memory or time limit fires, no guarantees are made about heap state or reference counts.** Discard the
     session rather than continuing to run code in it.
     The pool does not do this for you, and neither limit stops you: the duration budgets restart at the next feed, and
     after a `max_memory` trip a later feed may quietly succeed against a corrupted heap.
-- Compilation of the fed source is not charged against the duration budgets.
-    It has its own structural caps (AST nesting, bytecode operand sizes, comprehension nesting, `finally` expansion), but
+- The VM duration budgets do not charge compilation of the fed source.
+    The supervisor CPU limit includes compilation and protocol CPU during each execution request.
+    Compilation has its own structural caps (AST nesting, bytecode operand sizes, comprehension nesting, `finally` expansion), but
     a host accepting untrusted source should still isolate compilation — as the subprocess and WebAssembly runtimes do.
     The parser grows its native stack outside the allocator's accounting, so a source longer than
     `CompileOptions::source_scan_threshold` (4 KiB by default, and fixed at that for Python and JavaScript hosts) is
