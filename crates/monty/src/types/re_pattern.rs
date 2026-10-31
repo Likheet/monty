@@ -523,25 +523,25 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, RePattern> {
             Some(StaticStrings::Search) => {
                 let arg = args.get_one_arg("Pattern.search", vm.heap)?;
                 defer_drop!(arg, vm);
-                let text = arg.to_str(vm)?;
+                let text = arg.try_to_str(vm)?;
                 self.get(vm.heap).search(arg, text, vm.heap)
             }
             Some(StaticStrings::Match) => {
                 let arg = args.get_one_arg("Pattern.match", vm.heap)?;
                 defer_drop!(arg, vm);
-                let text = arg.to_str(vm)?;
+                let text = arg.try_to_str(vm)?;
                 self.get(vm.heap).match_start(arg, text, vm.heap)
             }
             Some(StaticStrings::Fullmatch) => {
                 let arg = args.get_one_arg("Pattern.fullmatch", vm.heap)?;
                 defer_drop!(arg, vm);
-                let text = arg.to_str(vm)?;
+                let text = arg.try_to_str(vm)?;
                 self.get(vm.heap).fullmatch(arg, text, vm.heap)
             }
             Some(StaticStrings::Findall) => {
                 let arg = args.get_one_arg("Pattern.findall", vm.heap)?;
                 defer_drop!(arg, vm);
-                let text = arg.to_str(vm)?;
+                let text = arg.try_to_str(vm)?;
                 self.get(vm.heap).findall(text, vm.heap)
             }
             Some(StaticStrings::Sub) => call_pattern_sub(self, args, vm),
@@ -549,7 +549,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, RePattern> {
             Some(StaticStrings::Finditer) => {
                 let arg = args.get_one_arg("Pattern.finditer", vm.heap)?;
                 defer_drop!(arg, vm);
-                let text = arg.to_str(vm)?;
+                let text = arg.try_to_str(vm)?;
                 self.get(vm.heap).finditer(arg, text, vm.heap)
             }
             _ => return Err(ExcType::attribute_error_method(Type::RePattern, attr, args, vm)),
@@ -590,14 +590,14 @@ fn call_pattern_sub<'h>(pattern: &HeapRead<'h, RePattern>, args: ArgValues, vm: 
             translate_replacement(template)?;
         }
         // Negative count — Pattern.sub returns the input string unchanged.
-        // The subject is still type-checked (`to_str` raises this method's
+        // The subject is still type-checked (`try_to_str` raises this method's
         // `expected string, not {t}` wording) before the refcount bump; no
         // need to re-allocate.
-        let _ = string_val.to_str(vm)?;
+        let _ = string_val.try_to_str(vm)?;
         return Ok(string_val.clone_with_heap(vm.heap));
     };
 
-    let text = string_val.to_str(vm)?;
+    let text = string_val.try_to_str(vm)?;
     if let Some(template) = template {
         pattern.get(vm.heap).sub(template, text, count, vm.heap)
     } else {
@@ -610,7 +610,7 @@ fn call_pattern_sub<'h>(pattern: &HeapRead<'h, RePattern>, args: ArgValues, vm: 
 /// A `sub()` replacement: `Some(template)` for a `str`, `None` for a function
 /// to call with each match, and CPython's error for anything else.
 pub(crate) fn sub_template<'a>(repl: &'a Value, vm: &'a VM<'_>) -> RunResult<Option<&'a str>> {
-    if let Ok(template) = repl.to_str(vm) {
+    if let Some(template) = repl.as_str(vm) {
         Ok(Some(template))
     } else if repl.is_callable(vm) {
         Ok(None)
@@ -637,7 +637,7 @@ pub(crate) fn sub_with_function(
     vm: &mut VM<'_>,
 ) -> RunResult<Value> {
     defer_drop!(matches, vm);
-    let text_len = subject.to_str(vm)?.len();
+    let text_len = subject.try_to_str(vm)?.len();
     let limit = if count == 0 { usize::MAX } else { count };
 
     let mut result = String::new();
@@ -662,7 +662,7 @@ pub(crate) fn sub_with_function(
             _ => unreachable!("finditer builds a list of matches"),
         };
         if start > last_end {
-            push_checked(&mut result, &subject.to_str(vm)?[last_end..start], vm)?;
+            push_checked(&mut result, &subject.try_to_str(vm)?[last_end..start], vm)?;
             item += 1;
         }
         // Clone the match only here, so that an error above has no reference to release.
@@ -670,9 +670,9 @@ pub(crate) fn sub_with_function(
         let replacement = vm.evaluate_function(repl, ArgValues::One(m))?;
         defer_drop!(replacement, vm);
         if !matches!(replacement, Value::None) {
-            match replacement.to_str(vm) {
-                Ok(text) => push_checked(&mut result, text, vm)?,
-                Err(_) => {
+            match replacement.as_str(vm) {
+                Some(text) => push_checked(&mut result, text, vm)?,
+                None => {
                     if first_bad.is_none() {
                         first_bad = Some((item, replacement.py_type_name(vm).into_owned()));
                     }
@@ -690,7 +690,7 @@ pub(crate) fn sub_with_function(
             "sequence item {item}: expected str instance, {type_name} found"
         )));
     }
-    push_checked(&mut result, &subject.to_str(vm)?[last_end..], vm)?;
+    push_checked(&mut result, &subject.try_to_str(vm)?[last_end..], vm)?;
     Ok(allocate_string(result, vm.heap))
 }
 
@@ -728,7 +728,7 @@ fn call_pattern_split<'h>(pattern: &HeapRead<'h, RePattern>, args: ArgValues, vm
     defer_drop!(string_val, vm);
 
     let maxsplit = extract_maxsplit(maxsplit_val, vm)?;
-    let text = string_val.to_str(vm)?.to_owned();
+    let text = string_val.try_to_str(vm)?.to_owned();
     pattern.get(vm.heap).split(&text, maxsplit, vm.heap)
 }
 

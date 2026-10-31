@@ -70,17 +70,18 @@ use tokio::{
 
 use crate::{
     async_dispatch::{
-        CoroutineMode, Dispatched, dispatch_coroutine, dispatch_function_call, dispatch_module_call,
+        CoroutineMode, Dispatched, dispatch_coroutine, dispatch_function_call, dispatch_intercepted_os_call,
         dispatch_module_coroutine, dispatch_system_sleep, wait_for_futures,
     },
     build::{extract_connect_headers, extract_repl_inputs, extract_source_code, extract_type_check_stubs},
     callback_context::{self, CallbackContext},
     exceptions::{MontyCrashedError, MontyDisconnectError, MontyError, MontyShutdown, MontyTypingError},
     external::{
-        CallResult, ExternalLookup, HostModules, HostNames, is_coroutine, is_module_call, resolve_object_attr,
+        CallResult, ExternalLookup, HostModules, HostNames, is_coroutine, is_intercepted_os_call, resolve_object_attr,
         wire_call_arguments,
     },
     get_not_handled,
+    import_files::{find_import_file_async, find_import_file_sync, module_import_search},
     limits::extract_limits,
     mount::PyMountDir,
     os_policy::OsPolicyArg,
@@ -134,6 +135,7 @@ impl PyMonty {
         max_processes = None,
         checkout_timeout = None,
         request_timeout = None,
+        execution_clock = "wall",
         max_checkouts_per_worker = None,
         feed_duration_limit_grace = 1.0,
         turn_duration_limit_grace = 1.0,
@@ -146,6 +148,7 @@ impl PyMonty {
         max_processes: Option<usize>,
         checkout_timeout: Option<f64>,
         request_timeout: Option<f64>,
+        execution_clock: &str,
         max_checkouts_per_worker: Option<u32>,
         feed_duration_limit_grace: Option<f64>,
         turn_duration_limit_grace: Option<f64>,
@@ -158,6 +161,7 @@ impl PyMonty {
                 max_processes,
                 checkout_timeout,
                 request_timeout,
+                execution_clock,
                 max_checkouts_per_worker,
                 GraceArgs {
                     feed: feed_duration_limit_grace,
@@ -533,6 +537,7 @@ impl PyAsyncMonty {
         max_processes = None,
         checkout_timeout = None,
         request_timeout = None,
+        execution_clock = "wall",
         max_checkouts_per_worker = None,
         feed_duration_limit_grace = 1.0,
         turn_duration_limit_grace = 1.0,
@@ -545,6 +550,7 @@ impl PyAsyncMonty {
         max_processes: Option<usize>,
         checkout_timeout: Option<f64>,
         request_timeout: Option<f64>,
+        execution_clock: &str,
         max_checkouts_per_worker: Option<u32>,
         feed_duration_limit_grace: Option<f64>,
         turn_duration_limit_grace: Option<f64>,
@@ -557,6 +563,7 @@ impl PyAsyncMonty {
                 max_processes,
                 checkout_timeout,
                 request_timeout,
+                execution_clock,
                 max_checkouts_per_worker,
                 GraceArgs {
                     feed: feed_duration_limit_grace,
@@ -1148,6 +1155,7 @@ fn parse_pool_config(
     max_processes: Option<usize>,
     checkout_timeout: Option<f64>,
     request_timeout: Option<f64>,
+    execution_clock: &str,
     max_checkouts_per_worker: Option<u32>,
     graces: GraceArgs,
 ) -> PyResult<PoolConfig> {
@@ -1156,6 +1164,11 @@ fn parse_pool_config(
         None => binary_finder(py)?.call0(py)?.extract(py)?,
     };
     let mut config = PoolConfig::subprocess(binary_path);
+    config.execution_clock = match execution_clock {
+        "wall" => monty_types::ExecutionClock::Wall,
+        "cpu" => monty_types::ExecutionClock::Cpu,
+        _ => return Err(PyValueError::new_err("execution_clock must be 'wall' or 'cpu'")),
+    };
     config.min_processes = min_processes;
     if let Some(max) = max_processes {
         config.max_processes = max;
@@ -1544,17 +1557,27 @@ fn drive_sync(py: Python<'_>, args: FeedArgs, names: &HostNames) -> PyResult<Py<
             })
         })?;
         let callback_guard = callback_context.enter(py, &native)?;
-        // the host's modules answer their own OS calls, ahead of mounts and `os=`
-        let module_call = matches!(&event, TurnEvent::OsCall { function_name, .. } if is_module_call(function_name));
+        // intercepted OS calls are answered here, ahead of mounts and `os=`
+        let intercepted =
+            matches!(&event, TurnEvent::OsCall { function_name, .. } if is_intercepted_os_call(function_name));
+        let search = module_import_search(&event);
         let resume_with = match event {
             TurnEvent::Complete(value) => return monty_to_py(py, &value, &instances),
-            TurnEvent::OsCall { .. } if module_call => match sync_turn_answer(py, event, &lookup, &instances) {
-                Ok(answer) => answer,
-                Err(err) => {
-                    discard_checkout_sync(py, &checkout);
-                    return Err(err);
+            TurnEvent::OsCall { .. } if intercepted => {
+                match sync_turn_answer(py, event, &lookup, &instances).and_then(|answer| match (answer, &search) {
+                    // no host module: the file search, `os=` then mounts
+                    (TurnAnswer::Call(ResumeValue::NotFound), Some(search)) => {
+                        find_import_file_sync(py, search, os.as_ref(), &instances, &checkout).map(TurnAnswer::Call)
+                    }
+                    (answer, _) => Ok(answer),
+                }) {
+                    Ok(answer) => answer,
+                    Err(err) => {
+                        discard_checkout_sync(py, &checkout);
+                        return Err(err);
+                    }
                 }
-            },
+            }
             // Immediate sleeps release the GIL; deferred async sleeps use tokio timers
             // so gathered sleeps overlap. Neither invokes the `os=` callback.
             TurnEvent::OsCall {
@@ -1695,8 +1718,8 @@ fn sync_turn_answer(
             function_name, args, ..
         } => {
             let result = lookup
-                .module_call(&function_name, &args)
-                .expect("only a module OS call reaches here");
+                .intercepted_os_call(&function_name, &args)
+                .expect("only an intercepted OS call reaches here");
             Ok(TurnAnswer::Call(ext_to_resume(result)?))
         }
         TurnEvent::ResolveFutures { .. } => Err(PyRuntimeError::new_err("async external functions require AsyncMonty")),
@@ -1805,14 +1828,28 @@ async fn drive_async_inner(args: FeedArgs, names: HostNames, started: Arc<Atomic
             .as_ref()
             .map(monty_pool::Checkout::callback_context)
             .unwrap_or_default();
-        // the host's modules answer their own OS calls, ahead of mounts and `os=`
-        let module_call = matches!(&event, TurnEvent::OsCall { function_name, .. } if is_module_call(function_name));
+        // intercepted OS calls are answered here, ahead of mounts and `os=`
+        let intercepted =
+            matches!(&event, TurnEvent::OsCall { function_name, .. } if is_intercepted_os_call(function_name));
+        let search = module_import_search(&event);
         let answer: TurnAnswer = match event {
             TurnEvent::Complete(value) => {
                 return Python::attach(|py| monty_to_py(py, &value, &instances));
             }
-            TurnEvent::OsCall { .. } if module_call => {
-                match async_turn_answer(event, &names, &instances, &mut join_set, &callback_context, &native).await {
+            TurnEvent::OsCall { .. } if intercepted => {
+                let answer =
+                    async_turn_answer(event, &names, &instances, &mut join_set, &callback_context, &native).await;
+                let answer = match (answer, &search) {
+                    // no host module: the file search, `os=` then mounts
+                    (Ok(TurnAnswer::Call(ResumeValue::NotFound)), Some(search)) => {
+                        let os = os.as_ref();
+                        find_import_file_async(search, os, &instances, &checkout, &callback_context, &native)
+                            .await
+                            .map(TurnAnswer::Call)
+                    }
+                    (answer, _) => answer,
+                };
+                match answer {
                     Ok(answer) => answer,
                     Err(err) => {
                         discard_checkout(&checkout).await;
@@ -1946,7 +1983,7 @@ async fn async_turn_answer(
             )
             .await
         }
-        // a module OS call, the only kind the drive loop sends here
+        // an intercepted OS call, the only kind the drive loop sends here
         TurnEvent::OsCall {
             function_name,
             args,
@@ -1954,7 +1991,7 @@ async fn async_turn_answer(
             allow_eager_await,
             ..
         } => {
-            let dispatch = || dispatch_module_call(&function_name, &args, names, instances);
+            let dispatch = || dispatch_intercepted_os_call(&function_name, &args, names, instances);
             answer_call(
                 dispatch,
                 call_id,
@@ -2193,6 +2230,7 @@ pub(crate) fn ext_to_resume(result: ExtFunctionResult) -> PyResult<ResumeValue> 
         ExtFunctionResult::Return(value) => Ok(ResumeValue::Return(value)),
         ExtFunctionResult::Error(exc) => Ok(ResumeValue::Error(exc)),
         ExtFunctionResult::NotFound(_) => Ok(ResumeValue::NotFound),
+        ExtFunctionResult::ModuleFile(file) => Ok(ResumeValue::ModuleFile(file)),
         // futures are handled explicitly by the async loop before this point
         ExtFunctionResult::Future(_) => Err(PyRuntimeError::new_err("unexpected future result")),
     }
@@ -2277,8 +2315,10 @@ pub(crate) fn pool_err_to_py(py: Python<'_>, err: PoolError) -> PyErr {
         PoolError::Crashed { status, .. } => {
             MontyCrashedError::new_err(py, message, false, status.and_then(|s| s.code()))
         }
-        PoolError::Timeout { .. } => MontyCrashedError::new_err(py, message, true, None),
-        PoolError::Disconnected { .. } => MontyDisconnectError::new_err(py, message),
+        PoolError::Timeout { .. } | PoolError::CpuLimit { .. } => MontyCrashedError::new_err(py, message, true, None),
+        PoolError::Disconnected { websocket, .. } => {
+            MontyDisconnectError::new_err(py, message, websocket.map(|details| *details))
+        }
         PoolError::Shutdown { dump } => MontyShutdown::new_err(py, message, dump),
         PoolError::Exhausted => PyTimeoutError::new_err(message),
         PoolError::Protocol(_) | PoolError::Spawn(_) | PoolError::Finished => PyRuntimeError::new_err(message),

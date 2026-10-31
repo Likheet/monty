@@ -2,7 +2,7 @@ use std::fmt::Write;
 
 use monty_types::MontyUuid;
 
-use super::{Dict, LazyHeapSet, PyTrait, Type, attribute_name_value};
+use super::{Dict, LazyHeapSet, PyTrait, Type};
 use crate::{
     args::ArgValues,
     boundary_uuid::create_uuid,
@@ -11,8 +11,8 @@ use crate::{
     exception_private::{ExcType, ExcTypeExt, RunResult},
     hash::{HashValue, identity_hash},
     heap::{
-        BorrowedHeapReadMut, DropGuard, DropWithContext, HeapId, HeapItem, HeapObjectRead, HeapReadMut, HeapReader,
-        heap_read_ref_as_field_mut,
+        BorrowedHeapReadMut, DropGuard, DropWithContext, Heap, HeapData, HeapId, HeapItem, HeapObjectRead, HeapReadMut,
+        HeapReader, heap_read_ref_as_field_mut,
     },
     intern::{Interns, StringId},
     types::{Union, str::allocate_string},
@@ -80,6 +80,26 @@ impl Class {
     pub fn namespace(&self) -> &Dict {
         &self.namespace
     }
+
+    /// What the class's own namespace binds `__annotations__` to.
+    pub(crate) fn annotations<'a>(&self, heap: &'a Heap, interns: &Interns) -> ClassAnnotations<'a> {
+        match self.namespace.get_by_str("__annotations__", heap, interns) {
+            None => ClassAnnotations::Missing,
+            Some(value) => match value.ref_id().map(|id| heap.get(id)) {
+                Some(HeapData::Dict(annotations)) => ClassAnnotations::Dict(annotations),
+                _ => ClassAnnotations::NotADict,
+            },
+        }
+    }
+}
+
+/// A class's `__annotations__` binding, from [`Class::annotations`].
+pub(crate) enum ClassAnnotations<'a> {
+    /// The class body annotated nothing and bound no `__annotations__`.
+    Missing,
+    Dict(&'a Dict),
+    /// Bound to something else, such as `None`, which `get_type_hints` rejects.
+    NotADict,
 }
 
 impl<'h> HeapReadMut<'h, Class> {
@@ -154,7 +174,7 @@ impl<'h> PyTrait<'h> for HeapObjectRead<'h, Class> {
 
     fn py_set_attr(&mut self, name: &EitherStr, value: Value, vm: &mut VM<'h>) -> RunResult<()> {
         let mut value_guard = DropGuard::new(value, vm);
-        let name = attribute_name_value(name, value_guard.ctx());
+        let name = name.as_value(value_guard.ctx().heap);
         let (value, vm) = value_guard.into_parts();
         let old_value = self.set_attr(name, value, vm)?;
         old_value.drop_with(vm);
