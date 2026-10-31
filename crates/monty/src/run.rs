@@ -746,12 +746,14 @@ impl Program {
                     args.drop_with(vm);
                     frame_exit_result = vm.resume_with_exception(err);
                 }
-                // An import nobody serves is a missing module.
+                // An import nobody serves is a missing module, and host hints are `{}`.
                 Ok(FrameExit::OsCall {
-                    function_call: call @ OsFunctionCall::Import(_),
+                    function_call: call @ (OsFunctionCall::Import(_) | OsFunctionCall::GetTypeHints(_)),
+                    effect,
                     ..
                 }) => {
-                    frame_exit_result = resume_with_result(vm, ExtFunctionResult::Error(call.on_no_handler()), None);
+                    vm.pending_effect = effect;
+                    frame_exit_result = resume_with_result(vm, call.no_handler_result(), None);
                 }
                 // Standard execution waits inline, excluding sleep from execution time.
                 Ok(FrameExit::OsCall {

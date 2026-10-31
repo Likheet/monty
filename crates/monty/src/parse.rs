@@ -17,7 +17,7 @@ use ruff_text_size::{Ranged, TextRange, TextSize};
 
 use crate::{
     args::{ArgExprs, CallArg, CallKwarg, Kwarg},
-    exception_private::{ExcType, ExcTypeExt, RunError, SimpleException},
+    exception_private::{ExcType, ExcTypeExt, ExceptionRaise, RunError, SimpleException},
     expressions::{
         AssignTarget, Callable, CmpOperator, Comprehension, DictItem, Expr, ExprLoc, Identifier, ImportName, Literal,
         MatchCase, Node, Operator, Pattern, SequenceItem, Submodule, UnpackTarget,
@@ -148,6 +148,9 @@ pub struct RawFunctionDef {
     pub body: Vec<ParseNode>,
     /// Whether this is an async function (`async def`).
     pub is_async: bool,
+    /// `(parameter or "return", stringized annotation)` pairs in CPython's order,
+    /// read back by `typing.get_type_hints()`.
+    pub annotations: Vec<(StringId, StringId)>,
 }
 
 /// Type alias for parsed AST nodes (output of the parser).
@@ -688,10 +691,18 @@ impl<'a, 'i> Parser<'a, 'i> {
                     }),
                 }
             }
-            Stmt::AnnAssign(ast::StmtAnnAssign { target, value, .. }) => match value {
-                Some(value) => self.parse_assignment(*target, *value),
-                None => Ok(Node::Pass),
-            },
+            Stmt::AnnAssign(ast::StmtAnnAssign {
+                target,
+                annotation,
+                value,
+                ..
+            }) => {
+                self.check_annotation(&annotation)?;
+                match value {
+                    Some(value) => self.parse_assignment(*target, *value),
+                    None => Ok(Node::Pass),
+                }
+            }
             Stmt::For(ast::StmtFor {
                 is_async,
                 target,
@@ -914,6 +925,8 @@ impl<'a, 'i> Parser<'a, 'i> {
                     };
                 }
                 // We only support absolute imports (level 0)
+                // TODO(site-packages): relative imports in modules imported from files,
+                // resolved against the importing module's `__package__`.
                 if level != 0 {
                     return Err(ParseError::import_error(
                         "attempted relative import with no known parent package",
@@ -1000,9 +1013,10 @@ impl<'a, 'i> Parser<'a, 'i> {
     /// before calling here, so it always receives an empty list.
     fn parse_function_def(
         &mut self,
-        function: ast::StmtFunctionDef,
+        mut function: ast::StmtFunctionDef,
     ) -> Result<(RawFunctionDef, Vec<ExprLoc>), ParseError> {
         let decorators = self.parse_decorators(function.decorator_list)?;
+        let annotations = self.parse_function_annotations(&mut function.parameters, function.returns.as_deref_mut())?;
 
         let params = &function.parameters;
 
@@ -1040,9 +1054,44 @@ impl<'a, 'i> Parser<'a, 'i> {
                 signature,
                 body,
                 is_async,
+                annotations,
             },
             decorators,
         ))
+    }
+
+    /// Stringizes a `def`'s parameter and return annotations, in the order
+    /// CPython stores them: regular parameters before positional-only ones,
+    /// then `*args`, keyword-only, `**kwargs` and `return`.
+    fn parse_function_annotations(
+        &mut self,
+        params: &mut ast::Parameters,
+        returns: Option<&mut AstExpr>,
+    ) -> Result<Vec<(StringId, StringId)>, ParseError> {
+        let ast::Parameters {
+            posonlyargs,
+            args,
+            vararg,
+            kwonlyargs,
+            kwarg,
+            ..
+        } = params;
+        let annotated = args
+            .iter_mut()
+            .chain(posonlyargs.iter_mut())
+            .map(|p| &mut p.parameter)
+            .chain(vararg.as_deref_mut())
+            .chain(kwonlyargs.iter_mut().map(|p| &mut p.parameter))
+            .chain(kwarg.as_deref_mut())
+            .filter_map(|p| Some((p.name.id.as_str(), p.annotation.as_deref_mut()?)))
+            .chain(returns.map(|r| ("return", r)));
+        let mut annotations = Vec::new();
+        for (name, annotation) in annotated {
+            self.check_annotation(annotation)?;
+            let text = stringize_annotation(annotation);
+            annotations.push((self.interner.intern(name), self.interner.intern(&text)));
+        }
+        Ok(annotations)
     }
 
     /// Parses decorator expressions in source order.
@@ -1255,6 +1304,7 @@ impl<'a, 'i> Parser<'a, 'i> {
             signature: ParsedSignature::default(),
             body,
             is_async: false,
+            annotations: Vec::new(),
         };
 
         Ok(Node::ClassDef {
@@ -1307,7 +1357,7 @@ impl<'a, 'i> Parser<'a, 'i> {
     /// The annotation never reaches [`Parser::parse_expression`], so the depth
     /// check guarding stringization's two recursive passes is made here.
     fn parse_class_annotation(&mut self, ident: Identifier, annotation: &mut AstExpr) -> Result<DictItem, ParseError> {
-        self.check_expression_depth(annotation)?;
+        self.check_annotation(annotation)?;
         let ann_range = annotation.range();
         let ann_id = self.interner.intern(&stringize_annotation(annotation));
         Ok(DictItem::Pair(
@@ -1353,6 +1403,19 @@ impl<'a, 'i> Parser<'a, 'i> {
             ))
         } else {
             Ok(())
+        }
+    }
+
+    /// Depth-checks an annotation and rejects what CPython's compiler refuses in
+    /// one: a walrus, `yield` or `await` evaluated in the annotation's own scope.
+    fn check_annotation(&self, annotation: &AstExpr) -> Result<(), ParseError> {
+        self.check_expression_depth(annotation)?;
+        match forbidden_in_annotation(annotation) {
+            Some((kind, range)) => Err(ParseError::syntax(
+                format!("{kind} cannot be used within an annotation"),
+                self.convert_range(range),
+            )),
+            None => Ok(()),
         }
     }
 
@@ -2619,6 +2682,57 @@ fn contains_class_scope_walrus(expr: &AstExpr) -> bool {
     finder.found
 }
 
+/// The first expression CPython rejects in an annotation, in source order, as
+/// its error's noun and range. Lambda bodies and comprehensions are their own
+/// scopes, so only lambda defaults and a comprehension's first iterable are checked.
+fn forbidden_in_annotation(annotation: &AstExpr) -> Option<(&'static str, TextRange)> {
+    /// Expression visitor recording the first forbidden expression.
+    struct Finder {
+        found: Option<(&'static str, TextRange)>,
+    }
+    impl Finder {
+        /// Visits a comprehension's first iterable, the only part evaluated in the annotation's scope.
+        fn visit_first_iter(&mut self, generators: &[ast::Comprehension]) {
+            if let Some(first) = generators.first() {
+                self.visit_expr(&first.iter);
+            }
+        }
+    }
+    impl<'a> Visitor<'a> for Finder {
+        fn visit_expr(&mut self, expr: &'a AstExpr) {
+            match expr {
+                _ if self.found.is_some() => {}
+                AstExpr::Named(e) => self.found = Some(("named expression", e.range)),
+                AstExpr::Yield(ast::ExprYield { range, .. }) | AstExpr::YieldFrom(ast::ExprYieldFrom { range, .. }) => {
+                    self.found = Some(("yield expression", *range));
+                }
+                AstExpr::Await(e) => self.found = Some(("await expression", e.range)),
+                // Defaults are evaluated in the annotation's scope, the body is not.
+                AstExpr::Lambda(lambda) => {
+                    for param in lambda
+                        .parameters
+                        .iter()
+                        .flat_map(|params| params.iter_non_variadic_params())
+                    {
+                        if let Some(default) = &param.default {
+                            self.visit_expr(default);
+                        }
+                    }
+                }
+                AstExpr::ListComp(ast::ExprListComp { generators, .. })
+                | AstExpr::SetComp(ast::ExprSetComp { generators, .. })
+                | AstExpr::Generator(ast::ExprGenerator { generators, .. }) => self.visit_first_iter(generators),
+                AstExpr::DictComp(ast::ExprDictComp { generators, .. }) => self.visit_first_iter(generators),
+                _ => walk_expr(self, expr),
+            }
+        }
+    }
+
+    let mut finder = Finder { found: None };
+    finder.visit_expr(annotation);
+    finder.found
+}
+
 /// The CPython error for a `*target` that is not an element of a tuple or list.
 fn starred_root_target(position: CodeRange) -> ParseError {
     ParseError::syntax("starred assignment target must be in a list or tuple", position)
@@ -2812,32 +2926,46 @@ impl ParseError {
         }
     }
 
+    /// Converts an imported file's compile error: the file is the innermost
+    /// traceback frame, under an `import` line shown without carets, as CPython does.
+    pub(crate) fn into_file_run_error(self, path: &str, source: &str) -> RunError {
+        let (exc_type, msg, frame) = self.into_parts(path, source);
+        RunError::Exc(ExceptionRaise {
+            exc: SimpleException::new_msg(exc_type, msg),
+            frame: None,
+            snippet_frame: Some(Box::new(frame)),
+            hide_caret: true,
+        })
+    }
+
     pub fn into_python_exc(self, filename: &str, source: &str) -> MontyException {
+        let (exc_type, msg, frame) = self.into_parts(filename, source);
+        MontyException::with_traceback(exc_type, Some(msg), vec![frame])
+    }
+
+    /// The exception type, message and the frame locating the error in `filename`.
+    fn into_parts(self, filename: &str, source: &str) -> (ExcType, String, StackFrame) {
         let mut source_map = SourceMap::new(source);
         match self {
-            Self::Syntax { msg, position } => MontyException::with_traceback(
+            Self::Syntax { msg, position } => (
                 ExcType::SyntaxError,
-                Some(msg.into_owned()),
-                vec![StackFrame::from_position_syntax_error(
-                    position,
-                    filename,
-                    &mut source_map,
-                )],
+                msg.into_owned(),
+                StackFrame::from_position_syntax_error(position, filename, &mut source_map),
             ),
-            Self::NotImplemented { msg, position } => MontyException::with_traceback(
+            Self::NotImplemented { msg, position } => (
                 ExcType::NotImplementedError,
-                Some(format!("The monty syntax parser does not yet support {msg}")),
-                vec![StackFrame::from_position(position, filename, &mut source_map)],
+                format!("The monty syntax parser does not yet support {msg}"),
+                StackFrame::from_position(position, filename, &mut source_map),
             ),
-            Self::NotSupported { msg, position } => MontyException::with_traceback(
+            Self::NotSupported { msg, position } => (
                 ExcType::NotImplementedError,
-                Some(msg.into_owned()),
-                vec![StackFrame::from_position(position, filename, &mut source_map)],
+                msg.into_owned(),
+                StackFrame::from_position(position, filename, &mut source_map),
             ),
-            Self::Import { msg, position } => MontyException::with_traceback(
+            Self::Import { msg, position } => (
                 ExcType::ImportError,
-                Some(msg.into_owned()),
-                vec![StackFrame::from_position_no_caret(position, filename, &mut source_map)],
+                msg.into_owned(),
+                StackFrame::from_position_no_caret(position, filename, &mut source_map),
             ),
         }
     }
