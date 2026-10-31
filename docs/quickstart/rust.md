@@ -52,6 +52,15 @@ carry no API compatibility guarantee.
 - **[`monty`](../api/rust/monty.md)** is the in-process interpreter.
     Use it when you control the code being run, or when subprocesses are impossible.
 
+Execution limits use wall time by default. CPU mode, Linux only, uses sampled thread CPU time.
+The `monty` crate enables the `monty-types/cpu-clock` feature for native CPU reads.
+`ExecutionClock::is_available()` checks whether this thread can read the selected clock.
+Off Linux a CPU-mode `ResourceTracker` charges elapsed time instead, so check it before selecting CPU mode directly.
+CPU-mode [`PoolConfig::subprocess`](../api/rust/monty-pool.md#poolconfig) pools independently measure child process CPU.
+They require a finite `PoolConfig::request_timeout` as a wall deadline.
+Remote deployments enable CPU enforcement in the server's local subprocess pool; WebSocket clients adopt its clock.
+See [resource limits](../resource-limits.md#time) for platform support, sampling, fallback, and snapshot compatibility.
+
 A Monty process can never be made fully crash-proof against memory errors — a stack-overflow abort or an allocator abort
 takes the whole process down.
 That is the entire reason `monty-pool` exists: the crash kills a worker, the pool notices and replaces it, and your
@@ -169,6 +178,13 @@ These are the poolable workers: prewarmed, reused across checkouts, replaced on 
 Those workers are single-use, never prewarmed or returned to the pool, and isolation becomes the remote host's
 responsibility.
 See [the security model](../security.md#remote-workers) before using it.
+
+### Host decode budget
+
+`PoolConfig::max_decode_bytes` can lower the default 1 GiB allocation budget for
+each protocol frame from a subprocess or WebSocket worker. Values above 1 GiB do not
+raise the ceiling. The budget excludes wire buffers and host-language conversion.
+Exhaustion discards the worker without replaying the request.
 
 ## The in-process interpreter
 
@@ -301,15 +317,43 @@ let RunProgress::Complete(result) = progress else { panic!("expected completion"
 assert_eq!(result, MontyObject::int(42));
 ```
 
+`typing.get_type_hints()` of a host function or class suspends with
+[`OsFunctionCall::GetTypeHints`](../api/rust/monty-types.md#osfunctioncall), naming the function (`TypeHintsTarget::Function`)
+or the class's id (`TypeHintsTarget::Class`).
+The host's answer is the call's result; `OsFunctionCall::no_handler_result()` answers `{}` for a host without hints:
+
+```rust
+use monty::{MontyRun, RunProgress};
+use monty_types::{CompileOptions, MontyObject, MontyType, OsFunctionCall, PrintWriter, ResourceTracker, TypeHintsTarget};
+
+let code = "import typing\ntyping.get_type_hints(fetch)['url']";
+let runner = MontyRun::new(code.to_owned(), "main.py", vec!["fetch".to_owned()], CompileOptions::default()).unwrap();
+let fetch = MontyObject::function("fetch", None);
+let progress = runner.start(vec![fetch], ResourceTracker::default(), PrintWriter::Stdout).unwrap();
+
+let RunProgress::OsCall(call) = progress else { panic!("expected an OS call") };
+let OsFunctionCall::GetTypeHints(TypeHintsTarget::Function(name)) = &call.function_call else { panic!() };
+assert_eq!(name, "fetch");
+let hints = MontyObject::dict([(MontyObject::string("url"), MontyObject::type_object(MontyType::Str))]);
+let progress = call.resume(hints, PrintWriter::Stdout).unwrap();
+assert_eq!(progress.into_complete().unwrap(), MontyObject::type_object(MontyType::Str));
+```
+
 Async host functions work the same way: [`FunctionCall::resume_pending`](../api/rust/monty.md#functioncall) continues with a pending future the sandboxed
 code can `await`, and when every task is blocked the run yields [`RunProgress::ResolveFutures`](../api/rust/monty.md#runprogress) for the host to settle.
 When `FunctionCall::allow_eager_await` is true the call is awaited immediately and no other task can run, so a host that already has the
 result can pass it to [`FunctionCall::resume_eager`](../api/rust/monty.md#functioncall) and skip the `ResolveFutures` round trip.
 
-Unknown imports suspend with [`OsFunctionCall::Import`](../api/rust/monty-types.md#osfunctioncall) and the top-level
-name.
+Unknown imports suspend with [`OsFunctionCall::Import`](../api/rust/monty-types.md#osfunctioncall), whose
+[`ImportArgs`](../api/rust/monty-types.md#importargs) carry the dotted name and the module's search path.
 The host's answer becomes the module; dotted imports read subsequent components as attributes.
 Hosts usually return a host-backed class instance containing the module's attributes.
+A host with no such module may answer with the module's `.py` file instead,
+[`ResumeValue::ModuleFile`](../api/rust/monty-pool.md#resumevalue) (in-process,
+[`ExtFunctionResult::ModuleFile`](../api/rust/monty-types.md#extfunctionresult)), which the sandbox runs as the module.
+`ImportArgs::candidates` lists the files to try, [`Checkout::read_from_mounts`](../api/rust/monty-pool.md#checkout)
+reads one through the feed's mounts without resuming, and `find_module_file` runs the whole search with a read
+function the host supplies.
 [`ResumeValue::NotFound`](../api/rust/monty-pool.md#resumevalue) and `NotHandled` raise `ModuleNotFoundError`;
 in-process, [`OsCall::resume`](../api/rust/monty.md#oscall) with
 [`ExtFunctionResult::NotFound`](../api/rust/monty-types.md#extfunctionresult) does the same, as does a run with no host.
@@ -360,3 +404,8 @@ assert_eq!(result, MontyObject::int(42));
 - [`FunctionCall::object_id`](../api/rust/monty.md#functioncall) and [`NameLookup::object_id`](../api/rust/monty.md#namelookup)
     identify the host receiver for routed calls and lookups, including class construction via `__call__`.
     Plain calls and lookups carry `None`.
+
+## Remote disconnects
+
+`PoolError::Disconnected` retains optional `websocket` details with the observed I/O stage, peer Close code and reason, or transport error.
+The peer reason is unverified text, and a disconnect does not establish whether the request ran.
